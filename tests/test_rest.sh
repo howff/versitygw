@@ -423,3 +423,21 @@ source ./tests/util/util_versioning.sh
   run get_and_check_no_policy_error "$BUCKET_ONE_NAME"
   assert_success
 }
+
+@test "REST - put policy" {
+  run setup_bucket "s3api" "$BUCKET_ONE_NAME"
+  assert_success
+
+  if ! result=$(COMMAND_LOG="$COMMAND_LOG" BUCKET_NAME="$BUCKET_ONE_NAME" POLICY_FILE=<(echo "false") OUTPUT_FILE="$TEST_FILE_FOLDER/result.txt" ./tests/rest_scripts/put_bucket_policy.sh); then
+    log 2 "error putting policy: $result"
+    return 1
+  fi
+  log 5 "response code: $result"
+  log 5 "response: $(cat "$TEST_FILE_FOLDER/result.txt")"
+  if ! result=$(COMMAND_LOG="$COMMAND_LOG" BUCKET_NAME="$BUCKET_ONE_NAME" OUTPUT_FILE="$TEST_FILE_FOLDER/policy.txt" ./tests/rest_scripts/get_bucket_policy.sh); then
+    log 2 "error attempting to get bucket policy response: $result"
+    return 1
+  fi
+  log 5 "policy: $(cat "$TEST_FILE_FOLDER/policy.txt")"
+  return 1
+}
