@@ -27,6 +27,13 @@ source ./tests/versity.sh
 setup() {
   base_setup
 
+  if [ -n "$TEST_LOG_FILE" ]; then
+    if [ -e "$TEST_FILE_FOLDER/log.tmp" ]; then
+      rm "$TEST_FILE_FOLDER/log.tmp"
+    fi
+    touch "$TEST_FILE_FOLDER/log.tmp"
+  fi
+
   log 4 "Running test $BATS_TEST_NAME"
   if [[ $LOG_LEVEL -ge 5 ]] || [[ -n "$TIME_LOG" ]]; then
     start_time=$(date +%s)
@@ -60,7 +67,11 @@ teardown() {
   if [[ ( "$BATS_TEST_COMPLETED" -ne 1 ) && ( -e "$COMMAND_LOG" ) ]]; then
     cat "$COMMAND_LOG"
     echo "**********************************************************************************"
+    echo "********************************** LOG *******************************************"
+    cat "$TEST_FILE_FOLDER/log.tmp"
+    echo "**********************************************************************************"
   fi
+  cat "$TEST_FILE_FOLDER/log.tmp" >> "$TEST_LOG_FILE"
   # shellcheck disable=SC2154
   if ! bucket_cleanup_if_bucket_exists "s3api" "$BUCKET_ONE_NAME"; then
     log 3 "error deleting bucket $BUCKET_ONE_NAME or contents"

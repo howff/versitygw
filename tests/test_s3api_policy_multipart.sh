@@ -28,9 +28,9 @@ test_s3api_policy_abort_multipart_upload() {
   run setup_bucket "s3api" "$BUCKET_ONE_NAME"
   assert_success
 
+  principal="$username"
   if [[ $DIRECT == "true" ]]; then
     setup_user_direct "$username" "user" "$BUCKET_ONE_NAME" || fail "error setting up direct user $username"
-    principal="{\"AWS\": \"arn:aws:iam::$DIRECT_AWS_USER_ID:user/$username\"}"
     # shellcheck disable=SC2154
     username=$key_id
     # shellcheck disable=SC2154
@@ -38,8 +38,8 @@ test_s3api_policy_abort_multipart_upload() {
   else
     password=$PASSWORD_ONE
     setup_user "$username" "$password" "user" || fail "error setting up user $username"
-    principal="\"$username\""
   fi
+  principal="$USERNAME_ONE"
 
   setup_policy_with_double_statement "$TEST_FILE_FOLDER/$policy_file" "2012-10-17" \
     "Allow" "$principal" "s3:PutObject" "arn:aws:s3:::$BUCKET_ONE_NAME/*" \

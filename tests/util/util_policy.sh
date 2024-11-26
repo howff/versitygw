@@ -50,7 +50,7 @@ get_modified_principal() {
   fi
   IFS=',' read -r -a principals <<< "$1"
   modified_principal=""
-  if [ "${#principals}" -gt 1 ]; then
+  if [ "${#principals[@]}" -gt 1 ]; then
     modified_principal="["
   fi
   for ((idx=0; idx<${#principals[@]}; idx++)); do
@@ -64,11 +64,11 @@ get_modified_principal() {
       # shellcheck disable=SC2089
       modified_principal+="\"${principals[$idx]}\""
     fi
-    if [[ ( "${#principals}" -gt 1 ) && ( $idx -lt ${#principals[@]}-1 ) ]]; then
+    if [[ ( "${#principals[@]}" -gt 1 ) && ( $idx -lt ${#principals[@]}-1 ) ]]; then
       modified_principal+=","
     fi
   done
-  if [ "${#principals}" -gt 1 ]; then
+  if [ "${#principals[@]}" -gt 1 ]; then
     modified_principal+="]"
   fi
   log 5 "modified principal: $modified_principal"
@@ -175,7 +175,20 @@ get_and_check_policy() {
 
   # shellcheck disable=SC2154
   log 5 "POLICY:  $bucket_policy"
-  if ! statement=$(echo "$bucket_policy" | jq -r '.Statement[0]' 2>&1); then
+  if ! check_policy "$bucket_policy" "$3" "$4" "$5" "$6"; then
+    log 2 "error checking policy"
+    return 1
+  fi
+  return 0
+}
+
+check_policy() {
+  if [ $# -ne 5 ]; then
+    log 2 "'check_policy' requires policy, expected effect, policy, action, resource"
+    return 1
+  fi
+  log 5 "policy: $1"
+  if ! statement=$(echo -n "$1" | jq -r '.Statement[0]' 2>&1); then
     log 2 "error getting statement value: $statement"
     return 1
   fi
@@ -183,8 +196,8 @@ get_and_check_policy() {
     log 2 "error getting effect: $returned_effect"
     return 1
   fi
-  if [[ "$3" != "$returned_effect" ]]; then
-    log 2 "effect mismatch (expected '$3', actual '$returned_effect')"
+  if [[ "$2" != "$returned_effect" ]]; then
+    log 2 "effect mismatch (expected '$2', actual '$returned_effect')"
     return 1
   fi
   if ! returned_principal=$(echo "$statement" | jq -r '.Principal' 2>&1); then
@@ -192,13 +205,13 @@ get_and_check_policy() {
     return 1
   fi
   if [[ -n $DIRECT ]] && arn=$(echo "$returned_principal" | jq -r '.AWS' 2>&1); then
-    if [[ $arn != "arn:aws:iam::$DIRECT_AWS_USER_ID:user/$DIRECT_S3_ROOT_ACCOUNT_NAME" ]]; then
-      log 2 "arn mismatch"
+    if [[ $arn != "$3" ]]; then
+      log 2 "arn mismatch (expected '$3', actual '$arn')"
       return 1
     fi
   else
-    if [[ "$4" != "$returned_principal" ]]; then
-      log 2 "principal mismatch (expected '$4', actual '$returned_principal')"
+    if [[ "$3" != "$returned_principal" ]]; then
+      log 2 "principal mismatch (expected '$3', actual '$returned_principal')"
       return 1
     fi
   fi
@@ -206,19 +219,19 @@ get_and_check_policy() {
     log 2 "error getting action: $returned_action"
     return 1
   fi
-  if [[ "$5" != "$returned_action" ]]; then
-    log 2 "action mismatch (expected '$5', actual '$returned_action')"
+  if [[ "$4" != "$returned_action" ]]; then
+    log 2 "action mismatch (expected '$4', actual '$returned_action')"
     return 1
   fi
   if ! returned_resource=$(echo "$statement" | jq -r '.Resource' 2>&1); then
     log 2 "error getting resource: $returned_resource"
     return 1
   fi
-  if [[ "$6" != "$returned_resource" ]]; then
-    log 2 "resource mismatch (expected '$6', actual '$returned_resource')"
+  if [[ "$5" != "$returned_resource" ]]; then
+    log 2 "resource mismatch (expected '$5', actual '$returned_resource')"
     return 1
   fi
-  return 0
+    return 0
 }
 
 put_and_check_for_malformed_policy() {
@@ -273,7 +286,7 @@ get_and_compare_policy_with_file() {
     return 1
   fi
   # shellcheck disable=SC2154
-  echo "$bucket_policy" > "$4-copy"
+  echo -n "$bucket_policy" > "$4-copy"
   log 5 "ORIG: $(cat "$4")"
   log 5 "COPY: $(cat "$4-copy")"
   if ! compare_files "$4" "$4-copy"; then
@@ -284,8 +297,8 @@ get_and_compare_policy_with_file() {
 }
 
 put_and_check_policy_rest() {
-  if [ $# -ne 2 ]; then
-    log 2 "'put_policy_rest' requires bucket name, policy file"
+  if [ $# -ne 6 ]; then
+    log 2 "'put_policy_rest' requires bucket name, policy file, effect, principal, action, resource"
     return 1
   fi
   if ! result=$(COMMAND_LOG="$COMMAND_LOG" BUCKET_NAME="$1" POLICY_FILE="$2" OUTPUT_FILE="$TEST_FILE_FOLDER/result.txt" ./tests/rest_scripts/put_bucket_policy.sh); then
@@ -293,8 +306,8 @@ put_and_check_policy_rest() {
     return 1
   fi
   log 5 "response code: $result"
-  if [ "$result" != "200" ]; then
-    log 2 "unexpected response code, expected '200', actual '$result'"
+  if [[ ( "$result" != "204" ) && ( "$result" != "200" ) ]]; then
+    log 2 "unexpected response code, expected '200' or '204', actual '$result' (reply: $(cat "$TEST_FILE_FOLDER/result.txt"))"
     return 1
   fi
   log 5 "response: $(cat "$TEST_FILE_FOLDER/result.txt")"
@@ -303,12 +316,17 @@ put_and_check_policy_rest() {
     return 1
   fi
   if [ "$result" != "200" ]; then
-    log 2 "unexpected response code, expected '200', actual '$result'"
+    log 2 "unexpected response code, expected '200', actual '$result' (reply: $(cat "$TEST_FILE_FOLDER/policy.txt"))"
     return 1
   fi
   log 5 "policy: $(cat "$TEST_FILE_FOLDER/policy.txt")"
-  if ! compare_files "$TEST_FILE_FOLDER/policy.txt" "$2"; then
-    log 2 "policies not equal (one: $(cat "$TEST_FILE_FOLDER/policy.txt"), two: $(cat "$2"))"
+  if [ "$DIRECT" == "true" ]; then
+    principal="arn:aws:iam::$DIRECT_AWS_USER_ID:user/$4"
+  else
+    principal="$4"
+  fi
+  if ! check_policy "$(cat "$TEST_FILE_FOLDER/policy.txt")" "$3" "$principal" "$5" "$6"; then
+    log 2 "policies not equal"
     return 1
   fi
   return 0
