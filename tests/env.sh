@@ -63,13 +63,7 @@ check_universal_vars() {
     source_config_file
   fi
   if [ -n "$COMMAND_LOG" ]; then
-    if [ -e "$COMMAND_LOG" ]; then
-      if ! error=$(rm "$COMMAND_LOG"); then
-        log 3 "error removing command log: $error"
-        return 1
-      fi
-    fi
-    echo "******** $(date +"%Y-%m-%d %H:%M:%S") $BATS_TEST_NAME COMMANDS ********" >> "$COMMAND_LOG"
+    init_command_log
   fi
 
   if [ "$GITHUB_ACTIONS" != "true" ] && [ -r "$SECRETS_FILE" ]; then
@@ -137,6 +131,16 @@ check_universal_vars() {
   fi
   # exporting these since they're needed for subshells
   export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_PROFILE AWS_ENDPOINT_URL
+}
+
+init_command_log() {
+  if [ -e "$COMMAND_LOG" ]; then
+    if ! error=$(rm "$COMMAND_LOG"); then
+      log 1 "error removing command log: $error"
+      exit 1
+    fi
+  fi
+  echo "******** $(date +"%Y-%m-%d %H:%M:%S") $BATS_TEST_NAME COMMANDS ********" >> "$COMMAND_LOG"
 }
 
 check_versity_vars() {

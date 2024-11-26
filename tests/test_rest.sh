@@ -42,6 +42,8 @@ source ./tests/util/util_tags.sh
 source ./tests/util/util_time.sh
 source ./tests/util/util_versioning.sh
 
+export RUN_USERS=true
+
 @test "test_rest_list_objects" {
   run setup_bucket "s3api" "$BUCKET_ONE_NAME"
   assert_success
@@ -428,16 +430,9 @@ source ./tests/util/util_versioning.sh
   run setup_bucket "s3api" "$BUCKET_ONE_NAME"
   assert_success
 
-  if ! result=$(COMMAND_LOG="$COMMAND_LOG" BUCKET_NAME="$BUCKET_ONE_NAME" POLICY_FILE=<(echo "false") OUTPUT_FILE="$TEST_FILE_FOLDER/result.txt" ./tests/rest_scripts/put_bucket_policy.sh); then
-    log 2 "error putting policy: $result"
-    return 1
-  fi
-  log 5 "response code: $result"
-  log 5 "response: $(cat "$TEST_FILE_FOLDER/result.txt")"
-  if ! result=$(COMMAND_LOG="$COMMAND_LOG" BUCKET_NAME="$BUCKET_ONE_NAME" OUTPUT_FILE="$TEST_FILE_FOLDER/policy.txt" ./tests/rest_scripts/get_bucket_policy.sh); then
-    log 2 "error attempting to get bucket policy response: $result"
-    return 1
-  fi
-  log 5 "policy: $(cat "$TEST_FILE_FOLDER/policy.txt")"
-  return 1
+  run setup_policy_with_single_statement "$TEST_FILE_FOLDER/policy_file.txt" "2012-10-17" "Allow" "$USERNAME_ONE" "s3:PutBucketTagging" "arn:aws:s3:::$BUCKET_ONE_NAME"
+  assert_success
+
+  run put_and_check_policy_rest "$BUCKET_ONE_NAME" "$TEST_FILE_FOLDER/policy_file.txt"
+  assert_success
 }
