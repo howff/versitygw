@@ -133,12 +133,18 @@ check_universal_vars() {
   export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_PROFILE AWS_ENDPOINT_URL
 }
 
-init_command_log() {
+delete_command_log() {
   if [ -e "$COMMAND_LOG" ]; then
     if ! error=$(rm "$COMMAND_LOG"); then
-      log 1 "error removing command log: $error"
-      exit 1
+      log 2 "error removing command log: $error"
+      return 1
     fi
+  fi
+}
+
+init_command_log() {
+  if ! delete_command_log; then
+    exit 1
   fi
   echo "******** $(date +"%Y-%m-%d %H:%M:%S") $BATS_TEST_NAME COMMANDS ********" >> "$COMMAND_LOG"
 }

@@ -133,6 +133,6 @@ log_message() {
     echo "$now $1 $2" >&2
   fi
   if [[ -n "$TEST_LOG_FILE" ]]; then
-    echo "$now $1 $2" >> "$TEST_FILE_FOLDER/log.tmp"
+    echo "$now $1 $2" >> "$TEST_LOG_FILE.tmp"
   fi
 }

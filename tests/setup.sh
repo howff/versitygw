@@ -28,10 +28,10 @@ setup() {
   base_setup
 
   if [ -n "$TEST_LOG_FILE" ]; then
-    if [ -e "$TEST_FILE_FOLDER/log.tmp" ]; then
-      rm "$TEST_FILE_FOLDER/log.tmp"
+    if ! error=$(touch "$TEST_LOG_FILE.tmp" 2>&1); then
+      log 2 "error creating log file: $error"
+      exit 1
     fi
-    touch "$TEST_FILE_FOLDER/log.tmp"
   fi
 
   log 4 "Running test $BATS_TEST_NAME"
@@ -55,6 +55,16 @@ setup() {
   export AWS_PROFILE
 }
 
+delete_temp_log_if_exists() {
+  if [ -e "$TEST_LOG_FILE.tmp" ]; then
+    if ! error=$(rm "$TEST_LOG_FILE.tmp" 2>&1); then
+      log 2 "error deleting temp log: $error"
+      return 1
+    fi
+  fi
+  return 0
+}
+
 # fail a test
 # param:  error message
 #fail() {
@@ -64,14 +74,28 @@ setup() {
 
 # bats teardown function
 teardown() {
-  if [[ ( "$BATS_TEST_COMPLETED" -ne 1 ) && ( -e "$COMMAND_LOG" ) ]]; then
-    cat "$COMMAND_LOG"
-    echo "**********************************************************************************"
-    echo "********************************** LOG *******************************************"
-    cat "$TEST_FILE_FOLDER/log.tmp"
-    echo "**********************************************************************************"
+  if [[ "$BATS_TEST_COMPLETED" -ne 1 ]]; then
+    if [[ -e "$COMMAND_LOG" ]]; then
+      cat "$COMMAND_LOG"
+      echo "**********************************************************************************"
+    fi
+    if [[ -e "$TEST_LOG_FILE.tmp" ]]; then
+      echo "********************************** LOG *******************************************"
+      cat "$TEST_LOG_FILE.tmp"
+      echo "**********************************************************************************"
+    fi
   fi
-  cat "$TEST_FILE_FOLDER/log.tmp" >> "$TEST_LOG_FILE"
+  if ! delete_command_log; then
+    log 2 "error deleting command log"
+  fi
+  if [ -e "$TEST_LOG_FILE.tmp" ]; then
+    if error=$(cat "$TEST_LOG_FILE.tmp" >> "$TEST_LOG_FILE" 2>&1); then
+      log 3 "error appending temp log to main log: $error"
+    fi
+    if ! delete_temp_log_if_exists; then
+      log 3 "error deleting temp log"
+    fi
+  fi
   # shellcheck disable=SC2154
   if ! bucket_cleanup_if_bucket_exists "s3api" "$BUCKET_ONE_NAME"; then
     log 3 "error deleting bucket $BUCKET_ONE_NAME or contents"

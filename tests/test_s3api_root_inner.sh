@@ -119,10 +119,6 @@ test_get_object_attributes_s3api_root() {
 }
 
 test_get_put_object_legal_hold_s3api_root() {
-  if [[ $RECREATE_BUCKETS == "false" ]]; then
-    skip "https://github.com/versity/versitygw/issues/716"
-  fi
-
   bucket_file="bucket_file"
   username=$USERNAME_ONE
   password=$PASSWORD_ONE
@@ -162,10 +158,6 @@ test_get_put_object_retention_s3api_root() {
   username=$USERNAME_ONE
   secret_key=$PASSWORD_ONE
 
-  if [[ $RECREATE_BUCKETS == "false" ]]; then
-    skip "https://github.com/versity/versitygw/issues/716"
-  fi
-
   run legal_hold_retention_setup "$username" "$secret_key" "$bucket_file"
   assert_success
 
@@ -198,9 +190,6 @@ test_get_put_object_retention_s3api_root() {
 }
 
 test_retention_bypass_s3api_root() {
-  if [[ $RECREATE_BUCKETS == "false" ]]; then
-    skip "https://github.com/versity/versitygw/issues/716"
-  fi
   bucket_file="bucket_file"
   username=$USERNAME_ONE
   secret_key=$PASSWORD_ONE
