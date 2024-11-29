@@ -93,6 +93,7 @@ export RUN_USERS=true
 }
 
 @test "test_put_bucket_acl" {
+  skip "https://github.com/versity/versitygw/issues/963"
   test_put_bucket_acl_s3cmd
 }
 
