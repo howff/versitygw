@@ -52,6 +52,7 @@ get_object_metadata_and_check_keys() {
     log 2 "error getting object metadata"
     return 1
   fi
+  # shellcheck disable=SC2154
   if ! key=$(echo "$metadata" | jq -r 'keys[]' 2>&1); then
     log 2 "error getting key from metadata: $key"
     return 1
