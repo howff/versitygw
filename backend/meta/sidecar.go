@@ -16,7 +16,7 @@ const (
 )
 
 // RetrieveAttribute retrieves the value of a specific attribute for an object or a bucket.
-func (s SideCar) RetrieveAttribute(bucket, object, attribute string) ([]byte, error) {
+func (s SideCar) RetrieveAttribute(f *os.File, bucket, object, attribute string) ([]byte, error) {
 	metadir := filepath.Join(sidecardir, bucket, object, sidecarmeta)
 	if object == "" {
 		metadir = filepath.Join(sidecardir, bucket, sidecarmeta)
@@ -35,7 +35,7 @@ func (s SideCar) RetrieveAttribute(bucket, object, attribute string) ([]byte, er
 }
 
 // StoreAttribute stores the value of a specific attribute for an object or a bucket.
-func (s SideCar) StoreAttribute(bucket, object, attribute string, value []byte) error {
+func (s SideCar) StoreAttribute(f *os.File, bucket, object, attribute string, value []byte) error {
 	metadir := filepath.Join(sidecardir, bucket, object, sidecarmeta)
 	if object == "" {
 		metadir = filepath.Join(sidecardir, bucket, sidecarmeta)

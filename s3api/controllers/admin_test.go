@@ -15,12 +15,11 @@
 package controllers
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
@@ -43,33 +42,26 @@ func TestAdminController_CreateUser(t *testing.T) {
 
 	app := fiber.New()
 
-	app.Use(func(ctx *fiber.Ctx) error {
-		ctx.Locals("account", auth.Account{Access: "admin1", Secret: "secret", Role: "admin"})
-		return ctx.Next()
-	})
-
 	app.Patch("/create-user", adminController.CreateUser)
 
-	appErr := fiber.New()
-
-	appErr.Use(func(ctx *fiber.Ctx) error {
-		ctx.Locals("account", auth.Account{Access: "user1", Secret: "secret", Role: "user"})
-		return ctx.Next()
-	})
-
-	usr := auth.Account{
-		Access: "access",
-		Secret: "secret",
-		Role:   "invalid role",
-	}
-
-	user, _ := json.Marshal(&usr)
-
-	usr.Role = "admin"
-
-	succUsr, _ := json.Marshal(&usr)
-
-	appErr.Patch("/create-user", adminController.CreateUser)
+	succUser := `
+		<Account>
+			<Access>access</Access>
+			<Secret>secret</Secret>
+			<Role>admin</Role>
+			<UserID>0</UserID>
+			<GroupID>0</GroupID>
+		</Account>
+	`
+	invuser := `
+		<Account>
+			<Access>access</Access>
+			<Secret>secret</Secret>
+			<Role>invalid_role</Role>
+			<UserID>0</UserID>
+			<GroupID>0</GroupID>
+		</Account>
+	`
 
 	tests := []struct {
 		name       string
@@ -79,31 +71,31 @@ func TestAdminController_CreateUser(t *testing.T) {
 		statusCode int
 	}{
 		{
-			name: "Admin-create-user-success",
+			name: "Admin-create-user-malformed-body",
 			app:  app,
-			args: args{
-				req: httptest.NewRequest(http.MethodPatch, "/create-user", bytes.NewBuffer(succUsr)),
-			},
-			wantErr:    false,
-			statusCode: 200,
-		},
-		{
-			name: "Admin-create-user-invalid-user-role",
-			app:  app,
-			args: args{
-				req: httptest.NewRequest(http.MethodPatch, "/create-user", bytes.NewBuffer(user)),
-			},
-			wantErr:    false,
-			statusCode: 500,
-		},
-		{
-			name: "Admin-create-user-invalid-requester-role",
-			app:  appErr,
 			args: args{
 				req: httptest.NewRequest(http.MethodPatch, "/create-user", nil),
 			},
 			wantErr:    false,
-			statusCode: 500,
+			statusCode: 400,
+		},
+		{
+			name: "Admin-create-user-invalid-requester-role",
+			app:  app,
+			args: args{
+				req: httptest.NewRequest(http.MethodPatch, "/create-user", strings.NewReader(invuser)),
+			},
+			wantErr:    false,
+			statusCode: 400,
+		},
+		{
+			name: "Admin-create-user-success",
+			app:  app,
+			args: args{
+				req: httptest.NewRequest(http.MethodPatch, "/create-user", strings.NewReader(succUser)),
+			},
+			wantErr:    false,
+			statusCode: 201,
 		},
 	}
 	for _, tt := range tests {
@@ -115,6 +107,100 @@ func TestAdminController_CreateUser(t *testing.T) {
 
 		if resp.StatusCode != tt.statusCode {
 			t.Errorf("AdminController.CreateUser() statusCode = %v, wantStatusCode = %v", resp.StatusCode, tt.statusCode)
+		}
+	}
+}
+
+func TestAdminController_UpdateUser(t *testing.T) {
+	type args struct {
+		req *http.Request
+	}
+
+	adminController := AdminController{
+		iam: &IAMServiceMock{
+			UpdateUserAccountFunc: func(access string, props auth.MutableProps) error {
+				return nil
+			},
+		},
+	}
+
+	app := fiber.New()
+
+	app.Patch("/update-user", adminController.UpdateUser)
+
+	adminControllerErr := AdminController{
+		iam: &IAMServiceMock{
+			UpdateUserAccountFunc: func(access string, props auth.MutableProps) error {
+				return auth.ErrNoSuchUser
+			},
+		},
+	}
+
+	appNotFound := fiber.New()
+
+	appNotFound.Patch("/update-user", adminControllerErr.UpdateUser)
+
+	succUser := `
+		<Account>
+			<Secret>secret</Secret>
+			<UserID>0</UserID>
+			<GroupID>0</GroupID>
+		</Account>
+	`
+
+	tests := []struct {
+		name       string
+		app        *fiber.App
+		args       args
+		wantErr    bool
+		statusCode int
+	}{
+		{
+			name: "Admin-update-user-success",
+			app:  app,
+			args: args{
+				req: httptest.NewRequest(http.MethodPatch, "/update-user?access=access", strings.NewReader(succUser)),
+			},
+			wantErr:    false,
+			statusCode: 200,
+		},
+		{
+			name: "Admin-update-user-missing-access",
+			app:  app,
+			args: args{
+				req: httptest.NewRequest(http.MethodPatch, "/update-user", strings.NewReader(succUser)),
+			},
+			wantErr:    false,
+			statusCode: 404,
+		},
+		{
+			name: "Admin-update-user-invalid-request-body",
+			app:  app,
+			args: args{
+				req: httptest.NewRequest(http.MethodPatch, "/update-user?access=access", nil),
+			},
+			wantErr:    false,
+			statusCode: 400,
+		},
+		{
+			name: "Admin-update-user-not-found",
+			app:  appNotFound,
+			args: args{
+				req: httptest.NewRequest(http.MethodPatch, "/update-user?access=access", strings.NewReader(succUser)),
+			},
+			wantErr:    false,
+			statusCode: 404,
+		},
+	}
+	for _, tt := range tests {
+		resp, err := tt.app.Test(tt.args.req)
+
+		if (err != nil) != tt.wantErr {
+			t.Errorf("AdminController.UpdateUser() error = %v, wantErr %v", err, tt.wantErr)
+		}
+
+		if resp.StatusCode != tt.statusCode {
+			t.Errorf("AdminController.UpdateUser() statusCode = %v, wantStatusCode = %v", resp.StatusCode, tt.statusCode)
 		}
 	}
 }
@@ -134,21 +220,7 @@ func TestAdminController_DeleteUser(t *testing.T) {
 
 	app := fiber.New()
 
-	app.Use(func(ctx *fiber.Ctx) error {
-		ctx.Locals("account", auth.Account{Access: "admin1", Secret: "secret", Role: "admin"})
-		return ctx.Next()
-	})
-
 	app.Patch("/delete-user", adminController.DeleteUser)
-
-	appErr := fiber.New()
-
-	appErr.Use(func(ctx *fiber.Ctx) error {
-		ctx.Locals("account", auth.Account{Access: "user1", Secret: "secret", Role: "user"})
-		return ctx.Next()
-	})
-
-	appErr.Patch("/delete-user", adminController.DeleteUser)
 
 	tests := []struct {
 		name       string
@@ -165,15 +237,6 @@ func TestAdminController_DeleteUser(t *testing.T) {
 			},
 			wantErr:    false,
 			statusCode: 200,
-		},
-		{
-			name: "Admin-delete-user-invalid-requester-role",
-			app:  appErr,
-			args: args{
-				req: httptest.NewRequest(http.MethodPatch, "/delete-user?access=test", nil),
-			},
-			wantErr:    false,
-			statusCode: 500,
 		},
 	}
 	for _, tt := range tests {
@@ -211,30 +274,9 @@ func TestAdminController_ListUsers(t *testing.T) {
 	}
 
 	appErr := fiber.New()
-
-	appErr.Use(func(ctx *fiber.Ctx) error {
-		ctx.Locals("account", auth.Account{Access: "admin1", Secret: "secret", Role: "admin"})
-		return ctx.Next()
-	})
-
 	appErr.Patch("/list-users", adminControllerErr.ListUsers)
 
-	appRoleErr := fiber.New()
-
-	appRoleErr.Use(func(ctx *fiber.Ctx) error {
-		ctx.Locals("account", auth.Account{Access: "user1", Secret: "secret", Role: "user"})
-		return ctx.Next()
-	})
-
-	appRoleErr.Patch("/list-users", adminController.ListUsers)
-
 	appSucc := fiber.New()
-
-	appSucc.Use(func(ctx *fiber.Ctx) error {
-		ctx.Locals("account", auth.Account{Access: "admin1", Secret: "secret", Role: "admin"})
-		return ctx.Next()
-	})
-
 	appSucc.Patch("/list-users", adminController.ListUsers)
 
 	tests := []struct {
@@ -244,15 +286,6 @@ func TestAdminController_ListUsers(t *testing.T) {
 		wantErr    bool
 		statusCode int
 	}{
-		{
-			name: "Admin-list-users-access-denied",
-			app:  appRoleErr,
-			args: args{
-				req: httptest.NewRequest(http.MethodPatch, "/list-users", nil),
-			},
-			wantErr:    false,
-			statusCode: 500,
-		},
 		{
 			name: "Admin-list-users-iam-error",
 			app:  appErr,
@@ -291,7 +324,7 @@ func TestAdminController_ChangeBucketOwner(t *testing.T) {
 	}
 	adminController := AdminController{
 		be: &BackendMock{
-			ChangeBucketOwnerFunc: func(contextMoqParam context.Context, bucket, newOwner string) error {
+			ChangeBucketOwnerFunc: func(contextMoqParam context.Context, bucket string, acl []byte) error {
 				return nil
 			},
 		},
@@ -319,39 +352,12 @@ func TestAdminController_ChangeBucketOwner(t *testing.T) {
 	}
 
 	app := fiber.New()
-
-	app.Use(func(ctx *fiber.Ctx) error {
-		ctx.Locals("account", auth.Account{Access: "admin1", Secret: "secret", Role: "admin"})
-		return ctx.Next()
-	})
-
 	app.Patch("/change-bucket-owner", adminController.ChangeBucketOwner)
 
-	appRoleErr := fiber.New()
-
-	appRoleErr.Use(func(ctx *fiber.Ctx) error {
-		ctx.Locals("account", auth.Account{Access: "user1", Secret: "secret", Role: "user"})
-		return ctx.Next()
-	})
-
-	appRoleErr.Patch("/change-bucket-owner", adminController.ChangeBucketOwner)
-
 	appIamErr := fiber.New()
-
-	appIamErr.Use(func(ctx *fiber.Ctx) error {
-		ctx.Locals("account", auth.Account{Access: "admin1", Secret: "secret", Role: "admin"})
-		return ctx.Next()
-	})
-
 	appIamErr.Patch("/change-bucket-owner", adminControllerIamErr.ChangeBucketOwner)
 
 	appIamNoSuchUser := fiber.New()
-
-	appIamNoSuchUser.Use(func(ctx *fiber.Ctx) error {
-		ctx.Locals("account", auth.Account{Access: "admin1", Secret: "secret", Role: "admin"})
-		return ctx.Next()
-	})
-
 	appIamNoSuchUser.Patch("/change-bucket-owner", adminControllerIamAccDoesNotExist.ChangeBucketOwner)
 
 	tests := []struct {
@@ -361,15 +367,6 @@ func TestAdminController_ChangeBucketOwner(t *testing.T) {
 		wantErr    bool
 		statusCode int
 	}{
-		{
-			name: "Change-bucket-owner-access-denied",
-			app:  appRoleErr,
-			args: args{
-				req: httptest.NewRequest(http.MethodPatch, "/change-bucket-owner", nil),
-			},
-			wantErr:    false,
-			statusCode: 500,
-		},
 		{
 			name: "Change-bucket-owner-check-account-server-error",
 			app:  appIamErr,
@@ -386,7 +383,7 @@ func TestAdminController_ChangeBucketOwner(t *testing.T) {
 				req: httptest.NewRequest(http.MethodPatch, "/change-bucket-owner", nil),
 			},
 			wantErr:    false,
-			statusCode: 500,
+			statusCode: 404,
 		},
 		{
 			name: "Change-bucket-owner-success",
@@ -395,7 +392,7 @@ func TestAdminController_ChangeBucketOwner(t *testing.T) {
 				req: httptest.NewRequest(http.MethodPatch, "/change-bucket-owner?bucket=bucket&owner=owner", nil),
 			},
 			wantErr:    false,
-			statusCode: 201,
+			statusCode: 200,
 		},
 	}
 	for _, tt := range tests {
@@ -424,22 +421,7 @@ func TestAdminController_ListBuckets(t *testing.T) {
 	}
 
 	app := fiber.New()
-
-	app.Use(func(ctx *fiber.Ctx) error {
-		ctx.Locals("account", auth.Account{Access: "admin1", Secret: "secret", Role: "admin"})
-		return ctx.Next()
-	})
-
 	app.Patch("/list-buckets", adminController.ListBuckets)
-
-	appRoleErr := fiber.New()
-
-	appRoleErr.Use(func(ctx *fiber.Ctx) error {
-		ctx.Locals("account", auth.Account{Access: "user1", Secret: "secret", Role: "user"})
-		return ctx.Next()
-	})
-
-	appRoleErr.Patch("/list-buckets", adminController.ListBuckets)
 
 	tests := []struct {
 		name       string
@@ -448,15 +430,6 @@ func TestAdminController_ListBuckets(t *testing.T) {
 		wantErr    bool
 		statusCode int
 	}{
-		{
-			name: "List-buckets-incorrect-role",
-			app:  appRoleErr,
-			args: args{
-				req: httptest.NewRequest(http.MethodPatch, "/list-buckets", nil),
-			},
-			wantErr:    false,
-			statusCode: 500,
-		},
 		{
 			name: "List-buckets-success",
 			app:  app,

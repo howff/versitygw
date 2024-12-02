@@ -1,62 +1,63 @@
 #!/usr/bin/env bats
 
+# Copyright 2024 Versity Software
+# This file is licensed under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http:#www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 source ./tests/setup.sh
 source ./tests/util_users.sh
 source ./tests/util.sh
-source ./tests/util_bucket_create.sh
+source ./tests/util_create_bucket.sh
+source ./tests/util_list_buckets.sh
+source ./tests/commands/list_buckets.sh
 
 test_admin_user() {
   if [[ $# -ne 1 ]]; then
     fail "test admin user command requires command type"
   fi
 
-  admin_username="ABCDEF"
-  user_username="GHIJKL"
-  admin_password="123456"
-  user_password="789012"
+  admin_username="$USERNAME_ONE"
+  admin_password="$PASSWORD_ONE"
+  user_username="$USERNAME_TWO"
+  user_password="$PASSWORD_TWO"
 
-  user_exists "$admin_username" || local admin_exists_result=$?
-  if [[ $admin_exists_result -eq 0 ]]; then
-    delete_user "$admin_username" || local delete_admin_result=$?
-    [[ $delete_admin_result -eq 0 ]] || fail "failed to delete admin user"
+  run setup_user "$admin_username" "$admin_password" "admin"
+  assert_success
+
+  if user_exists "$user_username"; then
+    run delete_user "$user_username"
+    assert_success
   fi
-  create_user "$admin_username" "$admin_password" "admin" || create_admin_result=$?
-  [[ $create_admin_result -eq 0 ]] || fail "failed to create admin user"
+  run create_user_with_user "$admin_username" "$admin_password" "$user_username" "$user_password" "user"
+  assert_success
 
-  user_exists "$user_username" || local user_exists_result=$?
-  if [[ $user_exists_result -eq 0 ]]; then
-    delete_user "$user_username" || local delete_user_result=$?
-    [[ $delete_user_result -eq 0 ]] || fail "failed to delete user user"
+  run setup_bucket "aws" "$BUCKET_ONE_NAME"
+  assert_success
+
+  if [ "$RECREATE_BUCKETS" == "true" ]; then
+    run create_bucket_with_user "s3api" "$BUCKET_TWO_NAME" "$admin_username" "$admin_password"
+    assert_success
+  else
+    run change_bucket_owner "$admin_username" "$admin_password" "$BUCKET_TWO_NAME" "$admin_username"
+    assert_success
   fi
-  create_user_with_user "$admin_username" "$admin_password" "$user_username" "$user_password" "user"
 
-  setup_bucket "aws" "$BUCKET_ONE_NAME" || local setup_result=$?
-  [[ $setup_result -eq 0 ]] || fail "error setting up bucket"
-  delete_bucket "aws" "versity-gwtest-admin-bucket" || local delete_result=$?
-  [[ $delete_result -eq 0 ]] || fail "error deleting bucket if it exists"
-  create_bucket_with_user "aws" "versity-gwtest-admin-bucket" "$admin_username" "$admin_password" || create_result_two=$?
-  [[ $create_result_two -eq 0 ]] || fail "error creating bucket with user"
+  run list_and_check_buckets_with_user "aws" "$BUCKET_ONE_NAME" "$BUCKET_TWO_NAME" "$admin_username" "$admin_password"
+  assert_success
 
-  bucket_one_found=false
-  bucket_two_found=false
-  list_buckets_with_user "aws" "$admin_username" "$admin_password"
-  for bucket in "${bucket_array[@]}"; do
-    if [ "$bucket" == "$BUCKET_ONE_NAME" ]; then
-      bucket_one_found=true
-    elif [ "$bucket" == "versity-gwtest-admin-bucket" ]; then
-      bucket_two_found=true
-    fi
-    if [ $bucket_one_found == true ] && [ $bucket_two_found == true ]; then
-      break
-    fi
-  done
-  if [ $bucket_one_found == false ] || [ $bucket_two_found == false ]; then
-    fail "not all expected buckets listed"
-  fi
-  change_bucket_owner "$admin_username" "$admin_password" "versity-gwtest-admin-bucket" "$user_username" || local change_result=$?
-  [[ $change_result -eq 0 ]] || fail "error changing bucket owner"
+  run change_bucket_owner "$admin_username" "$admin_password" "$BUCKET_TWO_NAME" "$user_username"
+  assert_success
 
-  delete_bucket "aws" "versity-gwtest-admin-bucket"
   delete_user "$user_username"
   delete_user "$admin_username"
 }
@@ -66,21 +67,16 @@ test_create_user_already_exists() {
     fail "test admin user command requires command type"
   fi
 
-  username="ABCDEG"
-  password="123456"
+  username="$USERNAME_ONE"
+  password="$PASSWORD_ONE"
 
-  user_exists "$username" || local exists_result=$?
-  if [[ $exists_result -eq 0 ]]; then
-    delete_user "$username" || local delete_result=$?
-    [[ $delete_result -eq 0 ]] || fail "failed to delete user '$username'"
+  run setup_user "$username" "123456" "admin"
+  assert_success "error setting up user"
+
+  if create_user "$username" "123456" "admin"; then
+    fail "'user already exists' error not returned"
   fi
 
-  create_user "$username" "123456" "admin" || local create_result=$?
-  [[ $create_result -eq 0 ]] || fail "error creating user"
-  create_user "$username" "123456" "admin" || local create_result=$?
-  [[ $create_result -eq 1 ]] || fail "'user already exists' error not returned"
-
-  delete_bucket "aws" "versity-gwtest-admin-bucket"
   delete_user "$username"
 }
 
@@ -89,34 +85,29 @@ test_user_user() {
     fail "test admin user command requires command type"
   fi
 
-  username="ABCDEG"
-  password="123456"
+  username="$USERNAME_ONE"
+  password="$PASSWORD_ONE"
 
-  user_exists "$username" || local exists_result=$?
-  if [[ $exists_result -eq 0 ]]; then
-    delete_user "$username" || local delete_result=$?
-    [[ $delete_result -eq 0 ]] || fail "failed to delete user '$username'"
+  setup_user "$username" "$password" "user" || fail "error setting up user"
+  bucket_cleanup_if_bucket_exists "aws" "versity-gwtest-user-bucket"
+
+  run setup_bucket "aws" "$BUCKET_ONE_NAME"
+  assert_success
+
+  if create_bucket_with_user "aws" "versity-gwtest-user-bucket" "$username" "$password"; then
+    fail "creating bucket with 'user' account failed to return error"
   fi
-  delete_bucket "aws" "versity-gwtest-user-bucket"
-
-  create_user "$username" "123456" "user" || local create_result=$?
-  [[ $create_result -eq 0 ]] || fail "error creating user"
-  setup_bucket "aws" "$BUCKET_ONE_NAME" || local setup_result=$?
-  [[ $setup_result -eq 0 ]] || fail "error setting up bucket"
-
-  create_bucket_with_user "aws" "versity-gwtest-user-bucket" "$username" "$password" || create_result_two=$?
-  [[ $create_result_two -eq 1 ]] || fail "creating bucket with 'user' account failed to return error"
+  # shellcheck disable=SC2154
   [[ $error == *"Access Denied"* ]] || fail "error message '$error' doesn't contain 'Access Denied'"
 
-  create_bucket "aws" "versity-gwtest-user-bucket" || create_result_three=$?
-  [[ $create_result_three -eq 0 ]] || fail "creating bucket account returned error"
+  create_bucket "aws" "versity-gwtest-user-bucket" || fail "error creating bucket"
 
-  change_bucket_owner "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "versity-gwtest-user-bucket" "$username" || local change_result=$?
-  [[ $change_result -eq 0 ]] || fail "error changing bucket owner"
-  change_bucket_owner "$username" "$password" "versity-gwtest-user-bucket" "admin" || local change_result_two=$?
-  [[ $change_result_two -eq 1 ]] || fail "user shouldn't be able to change bucket owner"
+  change_bucket_owner "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "versity-gwtest-user-bucket" "$username" || fail "error changing bucket owner"
+  if change_bucket_owner "$username" "$password" "versity-gwtest-user-bucket" "admin"; then
+    fail "user shouldn't be able to change bucket owner"
+  fi
 
-  list_buckets_with_user "aws" "$username" "$password"
+  list_buckets_with_user "aws" "$username" "$password" || fail "error listing buckets with user '$username'"
   bucket_found=false
   for bucket in "${bucket_array[@]}"; do
     if [ "$bucket" == "$BUCKET_ONE_NAME" ]; then
@@ -129,7 +120,8 @@ test_user_user() {
     fail "user-owned bucket not found in user list"
   fi
 
-  delete_bucket "aws" "versity-gwtest-user-bucket"
+  run delete_bucket "aws" "versity-gwtest-user-bucket"
+  assert_success "failed to delete bucket"
   delete_user "$username"
 }
 
@@ -138,25 +130,18 @@ test_userplus_operation() {
     fail "test admin user command requires command type"
   fi
 
-  username="ABCDEG"
-  password="123456"
+  username="$USERNAME_ONE"
+  password="$PASSWORD_ONE"
 
-  user_exists "$username" || local exists_result=$?
-  if [[ $exists_result -eq 0 ]]; then
-    delete_user "$username" || local delete_result=$?
-    [[ $delete_result -eq 0 ]] || fail "failed to delete user '$username'"
-  fi
-  delete_bucket "aws" "versity-gwtest-userplus-bucket"
+  bucket_cleanup_if_bucket_exists "aws" "versity-gwtest-userplus-bucket"
+  setup_user "$username" "$password" "userplus" || fail "error creating user '$username'"
 
-  create_user "$username" "123456" "userplus" || local create_result=$?
-  [[ $create_result -eq 0 ]] || fail "error creating user"
-  setup_bucket "aws" "$BUCKET_ONE_NAME" || local setup_result=$?
-  [[ $setup_result -eq 0 ]] || fail "error setting up bucket"
+  run setup_bucket "aws" "$BUCKET_ONE_NAME"
+  assert_success
 
-  create_bucket_with_user "aws" "versity-gwtest-userplus-bucket" "$username" "$password" || create_result_two=$?
-  [[ $create_result_two -eq 0 ]] || fail "error creating bucket"
+  create_bucket_with_user "aws" "versity-gwtest-userplus-bucket" "$username" "$password" || fail "error creating bucket with user '$username'"
 
-  list_buckets_with_user "aws" "$username" "$password"
+  list_buckets_with_user "aws" "$username" "$password" || fail "error listing buckets with user '$username'"
   bucket_found=false
   for bucket in "${bucket_array[@]}"; do
     if [ "$bucket" == "$BUCKET_ONE_NAME" ]; then
@@ -169,10 +154,11 @@ test_userplus_operation() {
     fail "userplus-owned bucket not found in user list"
   fi
 
-  change_bucket_owner "$username" "$password" "versity-gwtest-userplus-bucket" "admin" || local change_result_two=$?
-  [[ $change_result_two -eq 1 ]] || fail "userplus shouldn't be able to change bucket owner"
+  if change_bucket_owner "$username" "$password" "versity-gwtest-userplus-bucket" "admin"; then
+    fail "userplus shouldn't be able to change bucket owner"
+  fi
 
-  delete_bucket "aws" "versity-gwtest-admin-bucket"
-  delete_user "$username" || delete_result=$?
-  [[ $delete_result -eq 0 ]] || fail "error deleting user"
+  run delete_bucket "aws" "versity-gwtest-admin-bucket"
+  assert_success "failed to delete bucket"
+  delete_user "$username"
 }

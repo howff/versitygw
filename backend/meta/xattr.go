@@ -1,8 +1,23 @@
+// Copyright 2024 Versity Software
+// This file is licensed under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package meta
 
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -22,7 +37,15 @@ var (
 type XattrMeta struct{}
 
 // RetrieveAttribute retrieves the value of a specific attribute for an object in a bucket.
-func (x XattrMeta) RetrieveAttribute(bucket, object, attribute string) ([]byte, error) {
+func (x XattrMeta) RetrieveAttribute(f *os.File, bucket, object, attribute string) ([]byte, error) {
+	if f != nil {
+		b, err := xattr.FGet(f, xattrPrefix+attribute)
+		if errors.Is(err, xattr.ENOATTR) {
+			return nil, ErrNoSuchKey
+		}
+		return b, err
+	}
+
 	b, err := xattr.Get(filepath.Join(bucket, object), xattrPrefix+attribute)
 	if errors.Is(err, xattr.ENOATTR) {
 		return nil, ErrNoSuchKey
@@ -31,7 +54,11 @@ func (x XattrMeta) RetrieveAttribute(bucket, object, attribute string) ([]byte, 
 }
 
 // StoreAttribute stores the value of a specific attribute for an object in a bucket.
-func (x XattrMeta) StoreAttribute(bucket, object, attribute string, value []byte) error {
+func (x XattrMeta) StoreAttribute(f *os.File, bucket, object, attribute string, value []byte) error {
+	if f != nil {
+		return xattr.FSet(f, xattrPrefix+attribute, value)
+	}
+
 	return xattr.Set(filepath.Join(bucket, object), xattrPrefix+attribute, value)
 }
 

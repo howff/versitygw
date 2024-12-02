@@ -18,7 +18,9 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
-	"io/fs"
+	"io"
+	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -28,9 +30,10 @@ import (
 	"github.com/versity/versitygw/s3response"
 )
 
-var (
-	// RFC3339TimeFormat RFC3339 time format
-	RFC3339TimeFormat = "2006-01-02T15:04:05.999Z"
+const (
+	// this is the media type for directories in AWS and Nextcloud
+	DirContentType     = "application/x-directory"
+	DefaultContentType = "binary/octet-stream"
 )
 
 func IsValidBucketName(name string) bool { return true }
@@ -47,8 +50,18 @@ func (d ByObjectName) Len() int           { return len(d) }
 func (d ByObjectName) Swap(i, j int)      { d[i], d[j] = d[j], d[i] }
 func (d ByObjectName) Less(i, j int) bool { return *d[i].Key < *d[j].Key }
 
-func GetStringPtr(s string) *string {
-	return &s
+func GetPtrFromString(str string) *string {
+	if str == "" {
+		return nil
+	}
+	return &str
+}
+
+func GetStringFromPtr(str *string) string {
+	if str == nil {
+		return ""
+	}
+	return *str
 }
 
 func GetTimePtr(t time.Time) *time.Time {
@@ -61,9 +74,9 @@ var (
 
 // ParseRange parses input range header and returns startoffset, length, and
 // error. If no endoffset specified, then length is set to -1.
-func ParseRange(fi fs.FileInfo, acceptRange string) (int64, int64, error) {
+func ParseRange(size int64, acceptRange string) (int64, int64, error) {
 	if acceptRange == "" {
-		return 0, fi.Size(), nil
+		return 0, size, nil
 	}
 
 	rangeKv := strings.Split(acceptRange, "=")
@@ -99,6 +112,38 @@ func ParseRange(fi fs.FileInfo, acceptRange string) (int64, int64, error) {
 	return startOffset, endOffset - startOffset + 1, nil
 }
 
+// ParseCopySource parses x-amz-copy-source header and returns source bucket,
+// source object, versionId, error respectively
+func ParseCopySource(copySourceHeader string) (string, string, string, error) {
+	if copySourceHeader[0] == '/' {
+		copySourceHeader = copySourceHeader[1:]
+	}
+
+	var copySource, versionId string
+	i := strings.LastIndex(copySourceHeader, "?versionId=")
+	if i == -1 {
+		copySource = copySourceHeader
+	} else {
+		copySource = copySourceHeader[:i]
+		versionId = copySourceHeader[i+11:]
+	}
+
+	srcBucket, srcObject, ok := strings.Cut(copySource, "/")
+	if !ok {
+		return "", "", "", s3err.GetAPIError(s3err.ErrInvalidCopySource)
+	}
+
+	return srcBucket, srcObject, versionId, nil
+}
+
+func CreateExceedingRangeErr(objSize int64) s3err.APIError {
+	return s3err.APIError{
+		Code:           "InvalidArgument",
+		Description:    fmt.Sprintf("Range specified is not valid for source object of size: %d", objSize),
+		HTTPStatusCode: http.StatusBadRequest,
+	}
+}
+
 func GetMultipartMD5(parts []types.CompletedPart) string {
 	var partsEtagBytes []byte
 	for _, part := range parts {
@@ -119,4 +164,17 @@ func getEtagBytes(etag string) []byte {
 func md5String(data []byte) string {
 	sum := md5.Sum(data)
 	return hex.EncodeToString(sum[:])
+}
+
+type FileSectionReadCloser struct {
+	R io.Reader
+	F *os.File
+}
+
+func (f *FileSectionReadCloser) Read(p []byte) (int, error) {
+	return f.R.Read(p)
+}
+
+func (f *FileSectionReadCloser) Close() error {
+	return f.F.Close()
 }

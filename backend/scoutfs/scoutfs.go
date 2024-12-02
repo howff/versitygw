@@ -26,26 +26,34 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/pkg/xattr"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/backend"
+	"github.com/versity/versitygw/backend/meta"
 	"github.com/versity/versitygw/backend/posix"
 	"github.com/versity/versitygw/s3err"
+	"github.com/versity/versitygw/s3response"
 )
 
 type ScoutfsOpts struct {
 	ChownUID    bool
 	ChownGID    bool
 	GlacierMode bool
+	BucketLinks bool
+	NewDirPerm  fs.FileMode
 }
 
 type ScoutFS struct {
 	*posix.Posix
 	rootfd  *os.File
 	rootdir string
+
+	// bucket/object metadata storage facility
+	meta meta.MetadataStorer
 
 	// glaciermode enables the following behavior:
 	// GET object:  if file offline, return invalid object state
@@ -67,6 +75,9 @@ type ScoutFS struct {
 	// used to determine if chowning is needed
 	euid int
 	egid int
+
+	// newDirPerm is the permissions to use when creating new directories
+	newDirPerm fs.FileMode
 }
 
 var _ backend.Backend = &ScoutFS{}
@@ -75,8 +86,13 @@ const (
 	metaTmpDir          = ".sgwtmp"
 	metaTmpMultipartDir = metaTmpDir + "/multipart"
 	tagHdr              = "X-Amz-Tagging"
+	metaHdr             = "X-Amz-Meta"
+	contentTypeHdr      = "content-type"
+	contentEncHdr       = "content-encoding"
 	emptyMD5            = "d41d8cd98f00b204e9800998ecf8427e"
-	etagkey             = "user.etag"
+	etagkey             = "etag"
+	objectRetentionKey  = "object-retention"
+	objectLegalHoldKey  = "object-legal-hold"
 )
 
 var (
@@ -87,11 +103,12 @@ var (
 
 const (
 	// ScoutFS special xattr types
-
 	systemPrefix = "scoutfs.hide."
 	onameAttr    = systemPrefix + "objname"
 	flagskey     = systemPrefix + "sam_flags"
 	stagecopykey = systemPrefix + "sam_stagereq"
+
+	fsBlocksize = 4096
 )
 
 const (
@@ -179,18 +196,20 @@ func (s *ScoutFS) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		return nil, err
 	}
 
-	objdir := filepath.Join(bucket, metaTmpMultipartDir, fmt.Sprintf("%x", sum))
+	objdir := filepath.Join(metaTmpMultipartDir, fmt.Sprintf("%x", sum))
 
 	// check all parts ok
 	last := len(parts) - 1
 	partsize := int64(0)
 	var totalsize int64
-	for i, p := range parts {
-		if p.PartNumber == nil {
+	for i, part := range parts {
+		if part.PartNumber == nil || *part.PartNumber < 1 {
 			return nil, s3err.GetAPIError(s3err.ErrInvalidPart)
 		}
-		partPath := filepath.Join(objdir, uploadID, fmt.Sprintf("%v", *p.PartNumber))
-		fi, err := os.Lstat(partPath)
+
+		partObjPath := filepath.Join(objdir, uploadID, fmt.Sprintf("%v", *part.PartNumber))
+		fullPartPath := filepath.Join(bucket, partObjPath)
+		fi, err := os.Lstat(fullPartPath)
 		if err != nil {
 			return nil, s3err.GetAPIError(s3err.ErrInvalidPart)
 		}
@@ -198,23 +217,25 @@ func (s *ScoutFS) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		if i == 0 {
 			partsize = fi.Size()
 		}
+
+		// partsize must be a multiple of the filesystem blocksize
+		// except for last part
+		if i < last && partsize%fsBlocksize != 0 {
+			return nil, s3err.GetAPIError(s3err.ErrInvalidPart)
+		}
+
 		totalsize += fi.Size()
 		// all parts except the last need to be the same size
 		if i < last && partsize != fi.Size() {
 			return nil, s3err.GetAPIError(s3err.ErrInvalidPart)
 		}
-		// non-last part sizes need to be multiples of 4k for move blocks
-		// TODO: fallback to no move blocks if not 4k aligned?
-		if i == 0 && i < last && fi.Size()%4096 != 0 {
-			return nil, s3err.GetAPIError(s3err.ErrInvalidPart)
-		}
 
-		b, err := xattr.Get(partPath, "user.etag")
+		b, err := s.meta.RetrieveAttribute(nil, bucket, partObjPath, etagkey)
 		etag := string(b)
 		if err != nil {
 			etag = ""
 		}
-		if etag != *parts[i].ETag {
+		if parts[i].ETag == nil || etag != *parts[i].ETag {
 			return nil, s3err.GetAPIError(s3err.ErrInvalidPart)
 		}
 	}
@@ -230,57 +251,104 @@ func (s *ScoutFS) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	}
 	defer f.cleanup()
 
-	for _, p := range parts {
-		pf, err := os.Open(filepath.Join(objdir, uploadID, fmt.Sprintf("%v", *p.PartNumber)))
+	for _, part := range parts {
+		if part.PartNumber == nil || *part.PartNumber < 1 {
+			return nil, s3err.GetAPIError(s3err.ErrInvalidPart)
+		}
+
+		partObjPath := filepath.Join(objdir, uploadID, fmt.Sprintf("%v", *part.PartNumber))
+		fullPartPath := filepath.Join(bucket, partObjPath)
+		pf, err := os.Open(fullPartPath)
 		if err != nil {
-			return nil, fmt.Errorf("open part %v: %v", *p.PartNumber, err)
+			return nil, fmt.Errorf("open part %v: %v", *part.PartNumber, err)
 		}
 
 		// scoutfs move data is a metadata only operation that moves the data
 		// extent references from the source, appeding to the destination.
 		// this needs to be 4k aligned.
-		err = moveData(pf, f.f)
+		err = moveData(pf, f.File())
 		pf.Close()
 		if err != nil {
-			return nil, fmt.Errorf("move blocks part %v: %v", *p.PartNumber, err)
+			return nil, fmt.Errorf("move blocks part %v: %v", *part.PartNumber, err)
 		}
 	}
 
 	userMetaData := make(map[string]string)
 	upiddir := filepath.Join(objdir, uploadID)
-	loadUserMetaData(upiddir, userMetaData)
+	cType, _ := s.loadUserMetaData(bucket, upiddir, userMetaData)
 
 	objname := filepath.Join(bucket, object)
 	dir := filepath.Dir(objname)
 	if dir != "" {
 		uid, gid, doChown := s.getChownIDs(acct)
-		err = backend.MkdirAll(dir, uid, gid, doChown)
+		err = backend.MkdirAll(dir, uid, gid, doChown, s.newDirPerm)
 		if err != nil {
 			return nil, err
 		}
 	}
-	err = f.link()
-	if err != nil {
-		return nil, fmt.Errorf("link object in namespace: %w", err)
-	}
 
 	for k, v := range userMetaData {
-		err = xattr.Set(objname, "user."+k, []byte(v))
+		err = s.meta.StoreAttribute(f.File(), bucket, object, fmt.Sprintf("%v.%v", metaHdr, k), []byte(v))
 		if err != nil {
-			// cleanup object if returning error
-			os.Remove(objname)
 			return nil, fmt.Errorf("set user attr %q: %w", k, err)
+		}
+	}
+
+	// load and set tagging
+	tagging, err := s.meta.RetrieveAttribute(nil, bucket, upiddir, tagHdr)
+	if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
+		return nil, fmt.Errorf("get object tagging: %w", err)
+	}
+	if err == nil {
+		err := s.meta.StoreAttribute(f.File(), bucket, object, tagHdr, tagging)
+		if err != nil {
+			return nil, fmt.Errorf("set object tagging: %w", err)
+		}
+	}
+
+	// set content-type
+	if cType != "" {
+		err := s.meta.StoreAttribute(f.File(), bucket, object, contentTypeHdr, []byte(cType))
+		if err != nil {
+			return nil, fmt.Errorf("set object content type: %w", err)
+		}
+	}
+
+	// load and set legal hold
+	lHold, err := s.meta.RetrieveAttribute(nil, bucket, upiddir, objectLegalHoldKey)
+	if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
+		return nil, fmt.Errorf("get object legal hold: %w", err)
+	}
+	if err == nil {
+		err := s.meta.StoreAttribute(f.File(), bucket, object, objectLegalHoldKey, lHold)
+		if err != nil {
+			return nil, fmt.Errorf("set object legal hold: %w", err)
+		}
+	}
+
+	// load and set retention
+	ret, err := s.meta.RetrieveAttribute(nil, bucket, upiddir, objectRetentionKey)
+	if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
+		return nil, fmt.Errorf("get object retention: %w", err)
+	}
+	if err == nil {
+		err := s.meta.StoreAttribute(f.File(), bucket, object, objectRetentionKey, ret)
+		if err != nil {
+			return nil, fmt.Errorf("set object retention: %w", err)
 		}
 	}
 
 	// Calculate s3 compatible md5sum for complete multipart.
 	s3MD5 := backend.GetMultipartMD5(parts)
 
-	err = xattr.Set(objname, "user.etag", []byte(s3MD5))
+	err = s.meta.StoreAttribute(f.File(), bucket, object, etagkey, []byte(s3MD5))
 	if err != nil {
-		// cleanup object if returning error
-		os.Remove(objname)
 		return nil, fmt.Errorf("set etag attr: %w", err)
+	}
+
+	err = f.link()
+	if err != nil {
+		return nil, fmt.Errorf("link object in namespace: %w", err)
 	}
 
 	// cleanup tmp dirs
@@ -310,60 +378,106 @@ func (s *ScoutFS) checkUploadIDExists(bucket, object, uploadID string) ([32]byte
 	return sum, nil
 }
 
-func loadUserMetaData(path string, m map[string]string) (contentType, contentEncoding string) {
-	ents, err := xattr.List(path)
+// fll out the user metadata map with the metadata for the object
+// and return the content type and encoding
+func (s *ScoutFS) loadUserMetaData(bucket, object string, m map[string]string) (string, string) {
+	ents, err := s.meta.ListAttributes(bucket, object)
 	if err != nil || len(ents) == 0 {
-		return
+		return "", ""
 	}
 	for _, e := range ents {
 		if !isValidMeta(e) {
 			continue
 		}
-		b, err := xattr.Get(path, e)
-		if err == errNoData {
-			m[strings.TrimPrefix(e, "user.")] = ""
-			continue
-		}
+		b, err := s.meta.RetrieveAttribute(nil, bucket, object, e)
 		if err != nil {
 			continue
 		}
-		m[strings.TrimPrefix(e, "user.")] = string(b)
+		if b == nil {
+			m[strings.TrimPrefix(e, fmt.Sprintf("%v.", metaHdr))] = ""
+			continue
+		}
+		m[strings.TrimPrefix(e, fmt.Sprintf("%v.", metaHdr))] = string(b)
 	}
 
-	b, err := xattr.Get(path, "user.content-type")
+	var contentType, contentEncoding string
+	b, _ := s.meta.RetrieveAttribute(nil, bucket, object, contentTypeHdr)
 	contentType = string(b)
-	if err != nil {
-		contentType = ""
-	}
 	if contentType != "" {
-		m["content-type"] = contentType
+		m[contentTypeHdr] = contentType
 	}
 
-	b, err = xattr.Get(path, "user.content-encoding")
+	b, _ = s.meta.RetrieveAttribute(nil, bucket, object, contentEncHdr)
 	contentEncoding = string(b)
-	if err != nil {
-		contentEncoding = ""
-	}
 	if contentEncoding != "" {
-		m["content-encoding"] = contentEncoding
+		m[contentEncHdr] = contentEncoding
 	}
 
-	return
+	return contentType, contentEncoding
 }
 
 func isValidMeta(val string) bool {
-	if strings.HasPrefix(val, "user.X-Amz-Meta") {
+	if strings.HasPrefix(val, metaHdr) {
 		return true
 	}
-	if strings.EqualFold(val, "user.Expires") {
+	if strings.EqualFold(val, "Expires") {
 		return true
 	}
 	return false
 }
 
-func (s *ScoutFS) HeadObject(_ context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+func (s *ScoutFS) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+	if input.Bucket == nil {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	if input.Key == nil {
+		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+	}
 	bucket := *input.Bucket
 	object := *input.Key
+
+	if input.PartNumber != nil {
+		uploadId, sum, err := s.retrieveUploadId(bucket, object)
+		if err != nil {
+			return nil, err
+		}
+
+		ents, err := os.ReadDir(filepath.Join(bucket, metaTmpMultipartDir, fmt.Sprintf("%x", sum), uploadId))
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read parts: %w", err)
+		}
+
+		partPath := filepath.Join(metaTmpMultipartDir, fmt.Sprintf("%x", sum), uploadId, fmt.Sprintf("%v", *input.PartNumber))
+
+		part, err := os.Stat(filepath.Join(bucket, partPath))
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, s3err.GetAPIError(s3err.ErrInvalidPart)
+		}
+		if errors.Is(err, syscall.ENAMETOOLONG) {
+			return nil, s3err.GetAPIError(s3err.ErrKeyTooLong)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("stat part: %w", err)
+		}
+
+		b, err := s.meta.RetrieveAttribute(nil, bucket, partPath, etagkey)
+		etag := string(b)
+		if err != nil {
+			etag = ""
+		}
+		partsCount := int32(len(ents))
+		size := part.Size()
+
+		return &s3.HeadObjectOutput{
+			LastModified:  backend.GetTimePtr(part.ModTime()),
+			ETag:          &etag,
+			PartsCount:    &partsCount,
+			ContentLength: &size,
+		}, nil
+	}
 
 	_, err := os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -374,18 +488,30 @@ func (s *ScoutFS) HeadObject(_ context.Context, input *s3.HeadObjectInput) (*s3.
 	}
 
 	objPath := filepath.Join(bucket, object)
+
 	fi, err := os.Stat(objPath)
-	if errors.Is(err, fs.ErrNotExist) {
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+	}
+	if errors.Is(err, syscall.ENAMETOOLONG) {
+		return nil, s3err.GetAPIError(s3err.ErrKeyTooLong)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("stat object: %w", err)
 	}
+	if strings.HasSuffix(object, "/") && !fi.IsDir() {
+		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+	}
 
 	userMetaData := make(map[string]string)
-	contentType, contentEncoding := loadUserMetaData(objPath, userMetaData)
+	contentType, contentEncoding := s.loadUserMetaData(bucket, object, userMetaData)
 
-	b, err := xattr.Get(objPath, etagkey)
+	if fi.IsDir() {
+		// this is the media type for directories in AWS and Nextcloud
+		contentType = "application/x-directory"
+	}
+
+	b, err := s.meta.RetrieveAttribute(nil, bucket, object, etagkey)
 	etag := string(b)
 	if err != nil {
 		etag = ""
@@ -424,19 +550,55 @@ func (s *ScoutFS) HeadObject(_ context.Context, input *s3.HeadObjectInput) (*s3.
 
 	contentLength := fi.Size()
 
+	var objectLockLegalHoldStatus types.ObjectLockLegalHoldStatus
+	status, err := s.Posix.GetObjectLegalHold(ctx, bucket, object, *input.VersionId)
+	if err == nil {
+		if *status {
+			objectLockLegalHoldStatus = types.ObjectLockLegalHoldStatusOn
+		} else {
+			objectLockLegalHoldStatus = types.ObjectLockLegalHoldStatusOff
+		}
+	}
+
+	var objectLockMode types.ObjectLockMode
+	var objectLockRetainUntilDate *time.Time
+	retention, err := s.Posix.GetObjectRetention(ctx, bucket, object, *input.VersionId)
+	if err == nil {
+		var config types.ObjectLockRetention
+		if err := json.Unmarshal(retention, &config); err == nil {
+			objectLockMode = types.ObjectLockMode(config.Mode)
+			objectLockRetainUntilDate = config.RetainUntilDate
+		}
+	}
+
 	return &s3.HeadObjectOutput{
-		ContentLength:   &contentLength,
-		ContentType:     &contentType,
-		ContentEncoding: &contentEncoding,
-		ETag:            &etag,
-		LastModified:    backend.GetTimePtr(fi.ModTime()),
-		Metadata:        userMetaData,
-		StorageClass:    stclass,
-		Restore:         &requestOngoing,
+		ContentLength:             &contentLength,
+		ContentType:               &contentType,
+		ContentEncoding:           &contentEncoding,
+		ETag:                      &etag,
+		LastModified:              backend.GetTimePtr(fi.ModTime()),
+		Metadata:                  userMetaData,
+		StorageClass:              stclass,
+		Restore:                   &requestOngoing,
+		ObjectLockLegalHoldStatus: objectLockLegalHoldStatus,
+		ObjectLockMode:            objectLockMode,
+		ObjectLockRetainUntilDate: objectLockRetainUntilDate,
 	}, nil
 }
 
-func (s *ScoutFS) GetObject(_ context.Context, input *s3.GetObjectInput, writer io.Writer) (*s3.GetObjectOutput, error) {
+func (s *ScoutFS) retrieveUploadId(bucket, object string) (string, [32]byte, error) {
+	sum := sha256.Sum256([]byte(object))
+	objdir := filepath.Join(bucket, metaTmpMultipartDir, fmt.Sprintf("%x", sum))
+
+	entries, err := os.ReadDir(objdir)
+	if err != nil || len(entries) == 0 {
+		return "", [32]byte{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
+	}
+
+	return entries[0].Name(), sum, nil
+}
+
+func (s *ScoutFS) GetObject(_ context.Context, input *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
 	bucket := *input.Bucket
 	object := *input.Key
 	acceptRange := *input.Range
@@ -450,15 +612,23 @@ func (s *ScoutFS) GetObject(_ context.Context, input *s3.GetObjectInput, writer 
 	}
 
 	objPath := filepath.Join(bucket, object)
+
 	fi, err := os.Stat(objPath)
-	if errors.Is(err, fs.ErrNotExist) {
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+	}
+	if errors.Is(err, syscall.ENAMETOOLONG) {
+		return nil, s3err.GetAPIError(s3err.ErrKeyTooLong)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("stat object: %w", err)
 	}
 
-	startOffset, length, err := backend.ParseRange(fi, acceptRange)
+	if strings.HasSuffix(object, "/") && !fi.IsDir() {
+		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+	}
+
+	startOffset, length, err := backend.ParseRange(fi.Size(), acceptRange)
 	if err != nil {
 		return nil, err
 	}
@@ -505,19 +675,14 @@ func (s *ScoutFS) GetObject(_ context.Context, input *s3.GetObjectInput, writer 
 	if err != nil {
 		return nil, fmt.Errorf("open object: %w", err)
 	}
-	defer f.Close()
 
 	rdr := io.NewSectionReader(f, startOffset, length)
-	_, err = io.Copy(writer, rdr)
-	if err != nil {
-		return nil, fmt.Errorf("copy data: %w", err)
-	}
 
 	userMetaData := make(map[string]string)
 
-	contentType, contentEncoding := loadUserMetaData(objPath, userMetaData)
+	contentType, contentEncoding := s.loadUserMetaData(bucket, object, userMetaData)
 
-	b, err := xattr.Get(objPath, etagkey)
+	b, err := s.meta.RetrieveAttribute(nil, bucket, object, etagkey)
 	etag := string(b)
 	if err != nil {
 		etag = ""
@@ -541,6 +706,7 @@ func (s *ScoutFS) GetObject(_ context.Context, input *s3.GetObjectInput, writer 
 		TagCount:        &tagCount,
 		StorageClass:    types.StorageClassStandard,
 		ContentRange:    &contentRange,
+		Body:            &backend.FileSectionReadCloser{R: rdr, F: f},
 	}, nil
 }
 
@@ -565,9 +731,9 @@ func (s *ScoutFS) getXattrTags(bucket, object string) (map[string]string, error)
 	return tags, nil
 }
 
-func (s *ScoutFS) ListObjects(_ context.Context, input *s3.ListObjectsInput) (*s3.ListObjectsOutput, error) {
+func (s *ScoutFS) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
 	if input.Bucket == nil {
-		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+		return s3response.ListObjectsResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 	bucket := *input.Bucket
 	prefix := ""
@@ -589,20 +755,20 @@ func (s *ScoutFS) ListObjects(_ context.Context, input *s3.ListObjectsInput) (*s
 
 	_, err := os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		return s3response.ListObjectsResult{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("stat bucket: %w", err)
+		return s3response.ListObjectsResult{}, fmt.Errorf("stat bucket: %w", err)
 	}
 
 	fileSystem := os.DirFS(bucket)
-	results, err := backend.Walk(fileSystem, prefix, delim, marker, maxkeys,
+	results, err := backend.Walk(ctx, fileSystem, prefix, delim, marker, maxkeys,
 		s.fileToObj(bucket), []string{metaTmpDir}, []string{})
 	if err != nil {
-		return nil, fmt.Errorf("walk %v: %w", bucket, err)
+		return s3response.ListObjectsResult{}, fmt.Errorf("walk %v: %w", bucket, err)
 	}
 
-	return &s3.ListObjectsOutput{
+	return s3response.ListObjectsResult{
 		CommonPrefixes: results.CommonPrefixes,
 		Contents:       results.Objects,
 		Delimiter:      &delim,
@@ -615,9 +781,9 @@ func (s *ScoutFS) ListObjects(_ context.Context, input *s3.ListObjectsInput) (*s
 	}, nil
 }
 
-func (s *ScoutFS) ListObjectsV2(_ context.Context, input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
+func (s *ScoutFS) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Input) (s3response.ListObjectsV2Result, error) {
 	if input.Bucket == nil {
-		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+		return s3response.ListObjectsV2Result{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 	bucket := *input.Bucket
 	prefix := ""
@@ -639,20 +805,20 @@ func (s *ScoutFS) ListObjectsV2(_ context.Context, input *s3.ListObjectsV2Input)
 
 	_, err := os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		return s3response.ListObjectsV2Result{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("stat bucket: %w", err)
+		return s3response.ListObjectsV2Result{}, fmt.Errorf("stat bucket: %w", err)
 	}
 
 	fileSystem := os.DirFS(bucket)
-	results, err := backend.Walk(fileSystem, prefix, delim, marker, int32(maxkeys),
+	results, err := backend.Walk(ctx, fileSystem, prefix, delim, marker, int32(maxkeys),
 		s.fileToObj(bucket), []string{metaTmpDir}, []string{})
 	if err != nil {
-		return nil, fmt.Errorf("walk %v: %w", bucket, err)
+		return s3response.ListObjectsV2Result{}, fmt.Errorf("walk %v: %w", bucket, err)
 	}
 
-	return &s3.ListObjectsV2Output{
+	return s3response.ListObjectsV2Result{
 		CommonPrefixes:        results.CommonPrefixes,
 		Contents:              results.Objects,
 		Delimiter:             &delim,
@@ -666,53 +832,58 @@ func (s *ScoutFS) ListObjectsV2(_ context.Context, input *s3.ListObjectsV2Input)
 }
 
 func (s *ScoutFS) fileToObj(bucket string) backend.GetObjFunc {
-	return func(path string, d fs.DirEntry) (types.Object, error) {
+	return func(path string, d fs.DirEntry) (s3response.Object, error) {
 		objPath := filepath.Join(bucket, path)
 		if d.IsDir() {
 			// directory object only happens if directory empty
 			// check to see if this is a directory object by checking etag
-			etagBytes, err := xattr.Get(objPath, etagkey)
-			if isNoAttr(err) || errors.Is(err, fs.ErrNotExist) {
-				return types.Object{}, backend.ErrSkipObj
+			etagBytes, err := s.meta.RetrieveAttribute(nil, bucket, path, etagkey)
+			if errors.Is(err, meta.ErrNoSuchKey) || errors.Is(err, fs.ErrNotExist) {
+				return s3response.Object{}, backend.ErrSkipObj
 			}
 			if err != nil {
-				return types.Object{}, fmt.Errorf("get etag: %w", err)
+				return s3response.Object{}, fmt.Errorf("get etag: %w", err)
 			}
 			etag := string(etagBytes)
 
 			fi, err := d.Info()
 			if errors.Is(err, fs.ErrNotExist) {
-				return types.Object{}, backend.ErrSkipObj
+				return s3response.Object{}, backend.ErrSkipObj
 			}
 			if err != nil {
-				return types.Object{}, fmt.Errorf("get fileinfo: %w", err)
+				return s3response.Object{}, fmt.Errorf("get fileinfo: %w", err)
 			}
 
 			key := path + "/"
+			mtime := fi.ModTime()
 
-			return types.Object{
+			return s3response.Object{
 				ETag:         &etag,
 				Key:          &key,
-				LastModified: backend.GetTimePtr(fi.ModTime()),
+				LastModified: &mtime,
+				StorageClass: types.ObjectStorageClassStandard,
 			}, nil
 		}
 
 		// file object, get object info and fill out object data
-		etagBytes, err := xattr.Get(objPath, etagkey)
+		b, err := s.meta.RetrieveAttribute(nil, bucket, path, etagkey)
 		if errors.Is(err, fs.ErrNotExist) {
-			return types.Object{}, backend.ErrSkipObj
+			return s3response.Object{}, backend.ErrSkipObj
 		}
-		if err != nil && !isNoAttr(err) {
-			return types.Object{}, fmt.Errorf("get etag: %w", err)
+		if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
+			return s3response.Object{}, fmt.Errorf("get etag: %w", err)
 		}
-		etag := string(etagBytes)
+		// note: meta.ErrNoSuchKey will return etagBytes = []byte{}
+		// so this will just set etag to "" if its not already set
+
+		etag := string(b)
 
 		fi, err := d.Info()
 		if errors.Is(err, fs.ErrNotExist) {
-			return types.Object{}, backend.ErrSkipObj
+			return s3response.Object{}, backend.ErrSkipObj
 		}
 		if err != nil {
-			return types.Object{}, fmt.Errorf("get fileinfo: %w", err)
+			return s3response.Object{}, fmt.Errorf("get fileinfo: %w", err)
 		}
 
 		sc := types.ObjectStorageClassStandard
@@ -721,10 +892,10 @@ func (s *ScoutFS) fileToObj(bucket string) backend.GetObjFunc {
 			// If so, we will return the InvalidObjectState error.
 			st, err := statMore(objPath)
 			if errors.Is(err, fs.ErrNotExist) {
-				return types.Object{}, backend.ErrSkipObj
+				return s3response.Object{}, backend.ErrSkipObj
 			}
 			if err != nil {
-				return types.Object{}, fmt.Errorf("stat more: %w", err)
+				return s3response.Object{}, fmt.Errorf("stat more: %w", err)
 			}
 			if st.Offline_blocks != 0 {
 				sc = types.ObjectStorageClassGlacier
@@ -732,11 +903,12 @@ func (s *ScoutFS) fileToObj(bucket string) backend.GetObjFunc {
 		}
 
 		size := fi.Size()
+		mtime := fi.ModTime()
 
-		return types.Object{
+		return s3response.Object{
 			ETag:         &etag,
 			Key:          &path,
-			LastModified: backend.GetTimePtr(fi.ModTime()),
+			LastModified: &mtime,
 			Size:         &size,
 			StorageClass: sc,
 		}, nil
@@ -819,14 +991,8 @@ func fSetNewGlobalFlags(objname string, flags uint64) error {
 }
 
 func isNoAttr(err error) bool {
-	if err == nil {
-		return false
-	}
 	xerr, ok := err.(*xattr.Error)
 	if ok && xerr.Err == xattr.ENOATTR {
-		return true
-	}
-	if err == errNoData {
 		return true
 	}
 	return false

@@ -19,14 +19,17 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/urfave/cli/v2"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/backend"
+	"github.com/versity/versitygw/metrics"
 	"github.com/versity/versitygw/s3api"
 	"github.com/versity/versitygw/s3api/middlewares"
 	"github.com/versity/versitygw/s3event"
@@ -34,33 +37,43 @@ import (
 )
 
 var (
-	port, admPort                          string
-	rootUserAccess                         string
-	rootUserSecret                         string
-	region                                 string
-	admCertFile, admKeyFile                string
-	certFile, keyFile                      string
-	kafkaURL, kafkaTopic, kafkaKey         string
-	natsURL, natsTopic                     string
-	eventWebhookURL                        string
-	eventConfigFilePath                    string
-	logWebhookURL                          string
-	accessLog                              string
-	healthPath                             string
-	debug                                  bool
-	pprof                                  string
-	quiet                                  bool
-	iamDir                                 string
-	ldapURL, ldapBindDN, ldapPassword      string
-	ldapQueryBase, ldapObjClasses          string
-	ldapAccessAtr, ldapSecAtr, ldapRoleAtr string
-	s3IamAccess, s3IamSecret               string
-	s3IamRegion, s3IamBucket               string
-	s3IamEndpoint                          string
-	s3IamSslNoVerify, s3IamDebug           bool
-	iamCacheDisable                        bool
-	iamCacheTTL                            int
-	iamCachePrune                          int
+	port, admPort                            string
+	rootUserAccess                           string
+	rootUserSecret                           string
+	region                                   string
+	admCertFile, admKeyFile                  string
+	certFile, keyFile                        string
+	kafkaURL, kafkaTopic, kafkaKey           string
+	natsURL, natsTopic                       string
+	eventWebhookURL                          string
+	eventConfigFilePath                      string
+	logWebhookURL, accessLog                 string
+	adminLogFile                             string
+	healthPath                               string
+	debug                                    bool
+	pprof                                    string
+	quiet                                    bool
+	readonly                                 bool
+	iamDir                                   string
+	ldapURL, ldapBindDN, ldapPassword        string
+	ldapQueryBase, ldapObjClasses            string
+	ldapAccessAtr, ldapSecAtr, ldapRoleAtr   string
+	ldapUserIdAtr, ldapGroupIdAtr            string
+	vaultEndpointURL, vaultSecretStoragePath string
+	vaultMountPath, vaultRootToken           string
+	vaultRoleId, vaultRoleSecret             string
+	vaultServerCert, vaultClientCert         string
+	vaultClientCertKey                       string
+	s3IamAccess, s3IamSecret                 string
+	s3IamRegion, s3IamBucket                 string
+	s3IamEndpoint                            string
+	s3IamSslNoVerify, s3IamDebug             bool
+	iamCacheDisable                          bool
+	iamCacheTTL                              int
+	iamCachePrune                            int
+	metricsService                           string
+	statsdServers                            string
+	dogstatsServers                          string
 )
 
 var (
@@ -101,10 +114,13 @@ func main() {
 
 func initApp() *cli.App {
 	return &cli.App{
-		Name:  "versitygw",
-		Usage: "Start S3 gateway service with specified backend storage.",
-		Description: `The S3 gateway is an S3 protocol translator that allows an S3 client
-to access the supported backend storage as if it was a native S3 service.`,
+		Usage: "Versity S3 Gateway",
+		Description: `The Versity S3 Gateway is an S3 protocol translator that allows an S3 client
+to access the supported backend storage as if it was a native S3 service.
+VersityGW is an open-source project licensed under the Apache 2.0 License. The
+source code is hosted on GitHub at https://github.com/versity/versitygw, and
+documentation can be found in the GitHub wiki.`,
+		Copyright: "Copyright (c) 2023-2024 Versity Software",
 		Action: func(ctx *cli.Context) error {
 			return ctx.App.Command("help").Run(ctx)
 		},
@@ -211,6 +227,12 @@ func initFlags() []cli.Flag {
 			Usage:       "enable server access logging to specified file",
 			EnvVars:     []string{"LOGFILE", "VGW_ACCESS_LOG"},
 			Destination: &accessLog,
+		},
+		&cli.StringFlag{
+			Name:        "admin-access-log",
+			Usage:       "enable admin server access logging to specified file",
+			EnvVars:     []string{"LOGFILE", "VGW_ADMIN_ACCESS_LOG"},
+			Destination: &adminLogFile,
 		},
 		&cli.StringFlag{
 			Name:        "log-webhook-url",
@@ -322,6 +344,72 @@ func initFlags() []cli.Flag {
 			Destination: &ldapRoleAtr,
 		},
 		&cli.StringFlag{
+			Name:        "iam-ldap-user-id-atr",
+			Usage:       "ldap server user id attribute name",
+			EnvVars:     []string{"VGW_IAM_LDAP_USER_ID_ATR"},
+			Destination: &ldapUserIdAtr,
+		},
+		&cli.StringFlag{
+			Name:        "iam-ldap-group-id-atr",
+			Usage:       "ldap server user group id attribute name",
+			EnvVars:     []string{"VGW_IAM_LDAP_GROUP_ID_ATR"},
+			Destination: &ldapGroupIdAtr,
+		},
+		&cli.StringFlag{
+			Name:        "iam-vault-endpoint-url",
+			Usage:       "vault server url",
+			EnvVars:     []string{"VGW_IAM_VAULT_ENDPOINT_URL"},
+			Destination: &vaultEndpointURL,
+		},
+		&cli.StringFlag{
+			Name:        "iam-vault-secret-storage-path",
+			Usage:       "vault server secret storage path",
+			EnvVars:     []string{"VGW_IAM_VAULT_SECRET_STORAGE_PATH"},
+			Destination: &vaultSecretStoragePath,
+		},
+		&cli.StringFlag{
+			Name:        "iam-vault-mount-path",
+			Usage:       "vault server mount path",
+			EnvVars:     []string{"VGW_IAM_VAULT_MOUNT_PATH"},
+			Destination: &vaultMountPath,
+		},
+		&cli.StringFlag{
+			Name:        "iam-vault-root-token",
+			Usage:       "vault server root token",
+			EnvVars:     []string{"VGW_IAM_VAULT_ROOT_TOKEN"},
+			Destination: &vaultRootToken,
+		},
+		&cli.StringFlag{
+			Name:        "iam-vault-role-id",
+			Usage:       "vault server user role id",
+			EnvVars:     []string{"VGW_IAM_VAULT_ROLE_ID"},
+			Destination: &vaultRoleId,
+		},
+		&cli.StringFlag{
+			Name:        "iam-vault-role-secret",
+			Usage:       "vault server user role secret",
+			EnvVars:     []string{"VGW_IAM_VAULT_ROLE_SECRET"},
+			Destination: &vaultRoleSecret,
+		},
+		&cli.StringFlag{
+			Name:        "iam-vault-server_cert",
+			Usage:       "vault server TLS certificate",
+			EnvVars:     []string{"VGW_IAM_VAULT_SERVER_CERT"},
+			Destination: &vaultServerCert,
+		},
+		&cli.StringFlag{
+			Name:        "iam-vault-client_cert",
+			Usage:       "vault client TLS certificate",
+			EnvVars:     []string{"VGW_IAM_VAULT_CLIENT_CERT"},
+			Destination: &vaultClientCert,
+		},
+		&cli.StringFlag{
+			Name:        "iam-vault-client_cert_key",
+			Usage:       "vault client TLS certificate key",
+			EnvVars:     []string{"VGW_IAM_VAULT_CLIENT_CERT_KEY"},
+			Destination: &vaultClientCertKey,
+		},
+		&cli.StringFlag{
 			Name:        "s3-iam-access",
 			Usage:       "s3 IAM access key",
 			EnvVars:     []string{"VGW_S3_IAM_ACCESS_KEY"},
@@ -391,6 +479,33 @@ func initFlags() []cli.Flag {
 			EnvVars:     []string{"VGW_HEALTH"},
 			Destination: &healthPath,
 		},
+		&cli.BoolFlag{
+			Name:        "readonly",
+			Usage:       "allow only read operations across all the gateway",
+			EnvVars:     []string{"VGW_READ_ONLY"},
+			Destination: &readonly,
+		},
+		&cli.StringFlag{
+			Name:        "metrics-service-name",
+			Usage:       "service name tag for metrics, hostname if blank",
+			EnvVars:     []string{"VGW_METRICS_SERVICE_NAME"},
+			Aliases:     []string{"msn"},
+			Destination: &metricsService,
+		},
+		&cli.StringFlag{
+			Name:        "metrics-statsd-servers",
+			Usage:       "StatsD server urls comma separated. e.g. 'statsd1.example.com:8125,statsd2.example.com:8125'",
+			EnvVars:     []string{"VGW_METRICS_STATSD_SERVERS"},
+			Aliases:     []string{"mss"},
+			Destination: &statsdServers,
+		},
+		&cli.StringFlag{
+			Name:        "metrics-dogstatsd-servers",
+			Usage:       "DogStatsD server urls comma separated. e.g. '127.0.0.1:8125,dogstats.example.com:8125'",
+			EnvVars:     []string{"VGW_METRICS_DOGSTATS_SERVERS"},
+			Aliases:     []string{"mds"},
+			Destination: &dogstatsServers,
+		},
 	}
 }
 
@@ -408,10 +523,12 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 	}
 
 	app := fiber.New(fiber.Config{
-		AppName:           "versitygw",
-		ServerHeader:      "VERSITYGW",
-		StreamRequestBody: true,
-		DisableKeepalive:  true,
+		AppName:               "versitygw",
+		ServerHeader:          "VERSITYGW",
+		StreamRequestBody:     true,
+		DisableKeepalive:      true,
+		Network:               fiber.NetworkTCP,
+		DisableStartupMessage: true,
 	})
 
 	var opts []s3api.Option
@@ -442,10 +559,15 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 	if healthPath != "" {
 		opts = append(opts, s3api.WithHealth(healthPath))
 	}
+	if readonly {
+		opts = append(opts, s3api.WithReadOnly())
+	}
 
 	admApp := fiber.New(fiber.Config{
-		AppName:      "versitygw",
-		ServerHeader: "VERSITYGW",
+		AppName:               "versitygw",
+		ServerHeader:          "VERSITYGW",
+		Network:               fiber.NetworkTCP,
+		DisableStartupMessage: true,
 	})
 
 	var admOpts []s3api.AdminOpt
@@ -466,36 +588,62 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 	}
 
 	iam, err := auth.New(&auth.Opts{
-		Dir:                iamDir,
-		LDAPServerURL:      ldapURL,
-		LDAPBindDN:         ldapBindDN,
-		LDAPPassword:       ldapPassword,
-		LDAPQueryBase:      ldapQueryBase,
-		LDAPObjClasses:     ldapObjClasses,
-		LDAPAccessAtr:      ldapAccessAtr,
-		LDAPSecretAtr:      ldapSecAtr,
-		LDAPRoleAtr:        ldapRoleAtr,
-		S3Access:           s3IamAccess,
-		S3Secret:           s3IamSecret,
-		S3Region:           s3IamRegion,
-		S3Bucket:           s3IamBucket,
-		S3Endpoint:         s3IamEndpoint,
-		S3DisableSSlVerfiy: s3IamSslNoVerify,
-		S3Debug:            s3IamDebug,
-		CacheDisable:       iamCacheDisable,
-		CacheTTL:           iamCacheTTL,
-		CachePrune:         iamCachePrune,
+		RootAccount: auth.Account{
+			Access: rootUserAccess,
+			Secret: rootUserSecret,
+			Role:   auth.RoleAdmin,
+		},
+		Dir:                    iamDir,
+		LDAPServerURL:          ldapURL,
+		LDAPBindDN:             ldapBindDN,
+		LDAPPassword:           ldapPassword,
+		LDAPQueryBase:          ldapQueryBase,
+		LDAPObjClasses:         ldapObjClasses,
+		LDAPAccessAtr:          ldapAccessAtr,
+		LDAPSecretAtr:          ldapSecAtr,
+		LDAPRoleAtr:            ldapRoleAtr,
+		LDAPUserIdAtr:          ldapUserIdAtr,
+		LDAPGroupIdAtr:         ldapGroupIdAtr,
+		VaultEndpointURL:       vaultEndpointURL,
+		VaultSecretStoragePath: vaultSecretStoragePath,
+		VaultMountPath:         vaultMountPath,
+		VaultRootToken:         vaultRootToken,
+		VaultRoleId:            vaultRoleId,
+		VaultRoleSecret:        vaultRoleSecret,
+		VaultServerCert:        vaultServerCert,
+		VaultClientCert:        vaultClientCert,
+		VaultClientCertKey:     vaultClientCertKey,
+		S3Access:               s3IamAccess,
+		S3Secret:               s3IamSecret,
+		S3Region:               s3IamRegion,
+		S3Bucket:               s3IamBucket,
+		S3Endpoint:             s3IamEndpoint,
+		S3DisableSSlVerfiy:     s3IamSslNoVerify,
+		S3Debug:                s3IamDebug,
+		CacheDisable:           iamCacheDisable,
+		CacheTTL:               iamCacheTTL,
+		CachePrune:             iamCachePrune,
 	})
 	if err != nil {
 		return fmt.Errorf("setup iam: %w", err)
 	}
 
-	logger, err := s3log.InitLogger(&s3log.LogConfig{
-		LogFile:    accessLog,
-		WebhookURL: logWebhookURL,
+	loggers, err := s3log.InitLogger(&s3log.LogConfig{
+		LogFile:      accessLog,
+		WebhookURL:   logWebhookURL,
+		AdminLogFile: adminLogFile,
 	})
 	if err != nil {
 		return fmt.Errorf("setup logger: %w", err)
+	}
+
+	metricsManager, err := metrics.NewManager(ctx, metrics.Config{
+		ServiceName:      metricsService,
+		StatsdServers:    statsdServers,
+		DogStatsdServers: dogstatsServers,
+	})
+	if err != nil {
+		return fmt.Errorf("init metrics manager: %w", err)
 	}
 
 	evSender, err := s3event.InitEventSender(&s3event.EventConfig{
@@ -514,12 +662,16 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 	srv, err := s3api.New(app, be, middlewares.RootUserConfig{
 		Access: rootUserAccess,
 		Secret: rootUserSecret,
-	}, port, region, iam, logger, evSender, opts...)
+	}, port, region, iam, loggers.S3Logger, loggers.AdminLogger, evSender, metricsManager, opts...)
 	if err != nil {
 		return fmt.Errorf("init gateway: %v", err)
 	}
 
-	admSrv := s3api.NewAdminServer(admApp, be, middlewares.RootUserConfig{Access: rootUserAccess, Secret: rootUserSecret}, admPort, region, iam, admOpts...)
+	admSrv := s3api.NewAdminServer(admApp, be, middlewares.RootUserConfig{Access: rootUserAccess, Secret: rootUserSecret}, admPort, region, iam, loggers.AdminLogger, admOpts...)
+
+	if !quiet {
+		printBanner(port, admPort, certFile != "", admCertFile != "")
+	}
 
 	c := make(chan error, 2)
 	go func() { c <- srv.Serve() }()
@@ -536,10 +688,17 @@ Loop:
 		case err = <-c:
 			break Loop
 		case <-sigHup:
-			if logger != nil {
-				err = logger.HangUp()
+			if loggers.S3Logger != nil {
+				err = loggers.S3Logger.HangUp()
 				if err != nil {
-					err = fmt.Errorf("HUP logger: %w", err)
+					err = fmt.Errorf("HUP s3 logger: %w", err)
+					break Loop
+				}
+			}
+			if loggers.AdminLogger != nil {
+				err = loggers.AdminLogger.HangUp()
+				if err != nil {
+					err = fmt.Errorf("HUP admin logger: %w", err)
 					break Loop
 				}
 			}
@@ -557,13 +716,22 @@ Loop:
 		fmt.Fprintf(os.Stderr, "shutdown iam: %v\n", err)
 	}
 
-	if logger != nil {
-		err := logger.Shutdown()
+	if loggers.S3Logger != nil {
+		err := loggers.S3Logger.Shutdown()
 		if err != nil {
 			if saveErr == nil {
 				saveErr = err
 			}
-			fmt.Fprintf(os.Stderr, "shutdown logger: %v\n", err)
+			fmt.Fprintf(os.Stderr, "shutdown s3 logger: %v\n", err)
+		}
+	}
+	if loggers.AdminLogger != nil {
+		err := loggers.AdminLogger.Shutdown()
+		if err != nil {
+			if saveErr == nil {
+				saveErr = err
+			}
+			fmt.Fprintf(os.Stderr, "shutdown admin logger: %v\n", err)
 		}
 	}
 
@@ -577,5 +745,183 @@ Loop:
 		}
 	}
 
+	if metricsManager != nil {
+		metricsManager.Close()
+	}
+
 	return saveErr
+}
+
+func printBanner(port, admPort string, ssl, admSsl bool) {
+	interfaces, err := getMatchingIPs(port)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to match local IP addresses: %v\n", err)
+		return
+	}
+
+	var admInterfaces []string
+	if admPort != "" {
+		admInterfaces, err = getMatchingIPs(admPort)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to match admin port local IP addresses: %v\n", err)
+			return
+		}
+	}
+
+	title := "VersityGW"
+	version := fmt.Sprintf("Version %v, Build %v", Version, Build)
+	urls := []string{}
+
+	hst, prt, err := net.SplitHostPort(port)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to parse port: %v\n", err)
+		return
+	}
+
+	for _, ip := range interfaces {
+		url := fmt.Sprintf("http://%s:%s", ip, prt)
+		if ssl {
+			url = fmt.Sprintf("https://%s:%s", ip, prt)
+		}
+		urls = append(urls, url)
+	}
+
+	if hst == "" {
+		hst = "0.0.0.0"
+	}
+
+	boundHost := fmt.Sprintf("(bound on host %s and port %s)", hst, prt)
+
+	lines := []string{
+		centerText(title),
+		centerText(version),
+		centerText(boundHost),
+		centerText(""),
+	}
+
+	if len(admInterfaces) > 0 {
+		lines = append(lines,
+			leftText("S3 service listening on:"),
+		)
+	} else {
+		lines = append(lines,
+			leftText("Admin/S3 service listening on:"),
+		)
+	}
+
+	for _, url := range urls {
+		lines = append(lines, leftText("  "+url))
+	}
+
+	if len(admInterfaces) > 0 {
+		lines = append(lines,
+			centerText(""),
+			leftText("Admin service listening on:"),
+		)
+
+		_, prt, err := net.SplitHostPort(admPort)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to parse port: %v\n", err)
+			return
+		}
+
+		for _, ip := range admInterfaces {
+			url := fmt.Sprintf("http://%s:%s", ip, prt)
+			if admSsl {
+				url = fmt.Sprintf("https://%s:%s", ip, prt)
+			}
+			lines = append(lines, leftText("  "+url))
+		}
+	}
+
+	// Print the top border
+	fmt.Println("┌" + strings.Repeat("─", columnWidth-2) + "┐")
+
+	// Print each line
+	for _, line := range lines {
+		fmt.Printf("│%-*s│\n", columnWidth-2, line)
+	}
+
+	// Print the bottom border
+	fmt.Println("└" + strings.Repeat("─", columnWidth-2) + "┘")
+}
+
+// getMatchingIPs returns all IP addresses for local system interfaces that
+// match the input address specification.
+func getMatchingIPs(spec string) ([]string, error) {
+	// Split the input spec into IP and port
+	host, _, err := net.SplitHostPort(spec)
+	if err != nil {
+		return nil, fmt.Errorf("parse address/port: %v", err)
+	}
+
+	// Handle cases where IP is omitted (e.g., ":1234")
+	if host == "" {
+		host = "0.0.0.0"
+	}
+
+	ipaddr, err := net.ResolveIPAddr("ip", host)
+	if err != nil {
+		return nil, err
+	}
+
+	parsedInputIP := ipaddr.IP
+
+	var result []string
+
+	// Get all network interfaces
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, iface := range interfaces {
+		// Get all addresses associated with the interface
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return nil, err
+		}
+
+		for _, addr := range addrs {
+			// Parse the address to get the IP part
+			ipAddr, _, err := net.ParseCIDR(addr.String())
+			if err != nil {
+				return nil, err
+			}
+
+			if ipAddr.IsLinkLocalUnicast() {
+				continue
+			}
+			if ipAddr.IsInterfaceLocalMulticast() {
+				continue
+			}
+			if ipAddr.IsLinkLocalMulticast() {
+				continue
+			}
+
+			// Check if the IP matches the input specification
+			if parsedInputIP.Equal(net.IPv4(0, 0, 0, 0)) || parsedInputIP.Equal(ipAddr) {
+				result = append(result, ipAddr.String())
+			}
+		}
+	}
+
+	return result, nil
+}
+
+const columnWidth = 70
+
+func centerText(text string) string {
+	padding := (columnWidth - 2 - len(text)) / 2
+	if padding < 0 {
+		padding = 0
+	}
+	return strings.Repeat(" ", padding) + text
+}
+
+func leftText(text string) string {
+	if len(text) > columnWidth-2 {
+		return text
+	}
+	return text + strings.Repeat(" ", columnWidth-2-len(text))
 }

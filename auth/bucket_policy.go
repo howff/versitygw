@@ -16,10 +16,20 @@ package auth
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net/http"
 
 	"github.com/versity/versitygw/s3err"
+)
+
+var (
+	errResourceMismatch = errors.New("Action does not apply to any resource(s) in statement")
+	//lint:ignore ST1005 Reason: This error message is intended for end-user clarity and follows their expectations
+	errInvalidResource = errors.New("Policy has invalid resource")
+	//lint:ignore ST1005 Reason: This error message is intended for end-user clarity and follows their expectations
+	errInvalidPrincipal = errors.New("Invalid principal in policy")
+	//lint:ignore ST1005 Reason: This error message is intended for end-user clarity and follows their expectations
+	errInvalidAction = errors.New("Policy has invalid action")
 )
 
 type BucketPolicy struct {
@@ -75,11 +85,14 @@ func (bpi *BucketPolicyItem) Validate(bucket string, iam IAMService) error {
 
 	for action := range bpi.Actions {
 		isObjectAction := action.IsObjectAction()
-		if isObjectAction && !containsObjectAction {
-			return fmt.Errorf("unsupported object action '%v' on the specified resources", action)
+		if isObjectAction == nil {
+			break
 		}
-		if !isObjectAction && !containsBucketAction {
-			return fmt.Errorf("unsupported bucket action '%v' on the specified resources", action)
+		if *isObjectAction && !containsObjectAction {
+			return errResourceMismatch
+		}
+		if !*isObjectAction && !containsBucketAction {
+			return errResourceMismatch
 		}
 	}
 
@@ -108,6 +121,11 @@ func ValidatePolicyDocument(policyBin []byte, bucket string, iam IAMService) err
 		return getMalformedPolicyError(err)
 	}
 
+	if len(policy.Statement) == 0 {
+		//lint:ignore ST1005 Reason: This error message is intended for end-user clarity and follows their expectations
+		return getMalformedPolicyError(errors.New("Could not parse the policy: Statement is empty!"))
+	}
+
 	if err := policy.Validate(bucket, iam); err != nil {
 		return getMalformedPolicyError(err)
 	}
@@ -115,12 +133,7 @@ func ValidatePolicyDocument(policyBin []byte, bucket string, iam IAMService) err
 	return nil
 }
 
-func verifyBucketPolicy(policy []byte, access, bucket, object string, action Action) error {
-	// If bucket policy is not set
-	if len(policy) == 0 {
-		return nil
-	}
-
+func VerifyBucketPolicy(policy []byte, access, bucket, object string, action Action) error {
 	var bucketPolicy BucketPolicy
 	if err := json.Unmarshal(policy, &bucketPolicy); err != nil {
 		return err

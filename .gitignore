@@ -45,6 +45,7 @@ tests/.secrets*
 
 # IAM users files often created in testing
 users.json
+users.json.backup
 
 # env files for testing
 **/.env*
@@ -59,3 +60,10 @@ tests/!s3cfg.local.default
 
 # patches
 *.patch
+
+# grafana's local database (kept on filesystem for survival between instantiations)
+metrics-exploration/grafana_data/**
+
+# bats tools
+/tests/bats-assert
+/tests/bats-support

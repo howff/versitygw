@@ -1,3 +1,17 @@
+// Copyright 2023 Versity Software
+// This file is licensed under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package integration
 
 import (
@@ -10,11 +24,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	rnd "math/rand"
 	"net/http"
 	"net/url"
-	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,15 +39,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/versity/versitygw/s3err"
-	"github.com/versity/versitygw/s3response"
 )
 
 var (
-	bcktCount            = 0
-	succUsrCrt           = "The user has been created successfully"
-	failUsrCrt           = "failed to create user: update iam data: account already exists"
-	adminAccessDeniedMsg = "access denied: only admin users have access to this resource"
-	succDeleteUserMsg    = "The user has been deleted successfully"
+	bcktCount        = 0
+	adminErrorPrefix = "XAdmin"
 )
 
 func getBucketName() string {
@@ -40,15 +51,40 @@ func getBucketName() string {
 	return fmt.Sprintf("test-bucket-%v", bcktCount)
 }
 
-func setup(s *S3Conf, bucket string) error {
+func setup(s *S3Conf, bucket string, opts ...setupOpt) error {
 	s3client := s3.NewFromConfig(s.Config())
+
+	cfg := new(setupCfg)
+	for _, opt := range opts {
+		opt(cfg)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 	_, err := s3client.CreateBucket(ctx, &s3.CreateBucketInput{
-		Bucket: &bucket,
+		Bucket:                     &bucket,
+		ObjectLockEnabledForBucket: &cfg.LockEnabled,
+		ObjectOwnership:            cfg.Ownership,
 	})
 	cancel()
-	return err
+	if err != nil {
+		return err
+	}
+
+	if cfg.VersioningStatus != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+			Bucket: &bucket,
+			VersioningConfiguration: &types.VersioningConfiguration{
+				Status: cfg.VersioningStatus,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func teardown(s *S3Conf, bucket string) error {
@@ -68,25 +104,57 @@ func teardown(s *S3Conf, bucket string) error {
 		return nil
 	}
 
-	in := &s3.ListObjectsV2Input{Bucket: &bucket}
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		out, err := s3client.ListObjectsV2(ctx, in)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("failed to list objects: %w", err)
-		}
-
-		for _, item := range out.Contents {
-			err = deleteObject(&bucket, item.Key, nil)
+	if s.versioningEnabled {
+		in := &s3.ListObjectVersionsInput{Bucket: &bucket}
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+			out, err := s3client.ListObjectVersions(ctx, in)
+			cancel()
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to list objects: %w", err)
+			}
+
+			for _, item := range out.Versions {
+				err = deleteObject(&bucket, item.Key, item.VersionId)
+				if err != nil {
+					return err
+				}
+			}
+			for _, item := range out.DeleteMarkers {
+				err = deleteObject(&bucket, item.Key, item.VersionId)
+				if err != nil {
+					return err
+				}
+			}
+
+			if out.IsTruncated != nil && *out.IsTruncated {
+				in.KeyMarker = out.KeyMarker
+				in.VersionIdMarker = out.NextVersionIdMarker
+			} else {
+				break
 			}
 		}
+	} else {
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+			out, err := s3client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+				Bucket: &bucket,
+			})
+			cancel()
+			if err != nil {
+				return fmt.Errorf("failed to list objects: %w", err)
+			}
 
-		if out.IsTruncated != nil && *out.IsTruncated {
-			in.ContinuationToken = out.ContinuationToken
-		} else {
+			for _, item := range out.Contents {
+				err = deleteObject(&bucket, item.Key, nil)
+				if err != nil {
+					return err
+				}
+			}
+
+			if out.IsTruncated != nil && *out.IsTruncated {
+				continue
+			}
 			break
 		}
 	}
@@ -99,10 +167,28 @@ func teardown(s *S3Conf, bucket string) error {
 	return err
 }
 
-func actionHandler(s *S3Conf, testName string, handler func(s3client *s3.Client, bucket string) error) error {
+type setupCfg struct {
+	LockEnabled      bool
+	VersioningStatus types.BucketVersioningStatus
+	Ownership        types.ObjectOwnership
+}
+
+type setupOpt func(*setupCfg)
+
+func withLock() setupOpt {
+	return func(s *setupCfg) { s.LockEnabled = true }
+}
+func withOwnership(o types.ObjectOwnership) setupOpt {
+	return func(s *setupCfg) { s.Ownership = o }
+}
+func withVersioning(v types.BucketVersioningStatus) setupOpt {
+	return func(s *setupCfg) { s.VersioningStatus = v }
+}
+
+func actionHandler(s *S3Conf, testName string, handler func(s3client *s3.Client, bucket string) error, opts ...setupOpt) error {
 	runF(testName)
 	bucketName := getBucketName()
-	err := setup(s, bucketName)
+	err := setup(s, bucketName, opts...)
 	if err != nil {
 		failF("%v: failed to create a bucket: %v", testName, err)
 		return fmt.Errorf("%v: failed to create a bucket: %w", testName, err)
@@ -127,6 +213,21 @@ func actionHandler(s *S3Conf, testName string, handler func(s3client *s3.Client,
 	return handlerErr
 }
 
+func actionHandlerNoSetup(s *S3Conf, testName string, handler func(s3client *s3.Client, bucket string) error, _ ...setupOpt) error {
+	runF(testName)
+	client := s3.NewFromConfig(s.Config())
+	handlerErr := handler(client, "")
+	if handlerErr != nil {
+		failF("%v: %v", testName, handlerErr)
+	}
+
+	if handlerErr == nil {
+		passF(testName)
+	}
+
+	return handlerErr
+}
+
 type authConfig struct {
 	testName string
 	path     string
@@ -138,7 +239,7 @@ type authConfig struct {
 
 func authHandler(s *S3Conf, cfg *authConfig, handler func(req *http.Request) error) error {
 	runF(cfg.testName)
-	req, err := createSignedReq(cfg.method, s.endpoint, cfg.path, s.awsID, s.awsSecret, cfg.service, s.awsRegion, cfg.body, cfg.date)
+	req, err := createSignedReq(cfg.method, s.endpoint, cfg.path, s.awsID, s.awsSecret, cfg.service, s.awsRegion, cfg.body, cfg.date, nil)
 	if err != nil {
 		failF("%v: %v", cfg.testName, err)
 		return fmt.Errorf("%v: %w", cfg.testName, err)
@@ -167,7 +268,7 @@ func presignedAuthHandler(s *S3Conf, testName string, handler func(client *s3.Pr
 	return nil
 }
 
-func createSignedReq(method, endpoint, path, access, secret, service, region string, body []byte, date time.Time) (*http.Request, error) {
+func createSignedReq(method, endpoint, path, access, secret, service, region string, body []byte, date time.Time, headers map[string]string) (*http.Request, error) {
 	req, err := http.NewRequest(method, fmt.Sprintf("%v/%v", endpoint, path), bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to send the request: %w", err)
@@ -179,6 +280,9 @@ func createSignedReq(method, endpoint, path, access, secret, service, region str
 	hexPayload := hex.EncodeToString(hashedPayload[:])
 
 	req.Header.Set("X-Amz-Content-Sha256", hexPayload)
+	for key, val := range headers {
+		req.Header.Add(key, val)
+	}
 
 	signErr := signer.SignHTTP(req.Context(), aws.Credentials{AccessKeyID: access, SecretAccessKey: secret}, req, hexPayload, service, region, date)
 	if signErr != nil {
@@ -244,33 +348,131 @@ func checkSdkApiErr(err error, code string) error {
 	return err
 }
 
-func putObjects(client *s3.Client, objs []string, bucket string) error {
+func putObjects(client *s3.Client, objs []string, bucket string) ([]types.Object, error) {
+	var contents []types.Object
+	var size int64
 	for _, key := range objs {
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := client.PutObject(ctx, &s3.PutObjectInput{
+		res, err := client.PutObject(ctx, &s3.PutObjectInput{
 			Key:    &key,
 			Bucket: &bucket,
 		})
 		cancel()
 		if err != nil {
-			return err
+			return nil, err
 		}
+		k := key
+		etag := strings.Trim(*res.ETag, `"`)
+		contents = append(contents, types.Object{
+			Key:          &k,
+			ETag:         &etag,
+			StorageClass: types.ObjectStorageClassStandard,
+			Size:         &size,
+		})
 	}
-	return nil
+
+	sort.SliceStable(contents, func(i, j int) bool {
+		return *contents[i].Key < *contents[j].Key
+	})
+
+	return contents, nil
 }
 
-func putObjectWithData(lgth int64, input *s3.PutObjectInput, client *s3.Client) (csum [32]byte, data []byte, err error) {
-	data = make([]byte, lgth)
+func listObjects(client *s3.Client, bucket, prefix, delimiter string, maxKeys int32) ([]types.Object, []types.CommonPrefix, error) {
+	var contents []types.Object
+	var commonPrefixes []types.CommonPrefix
+
+	var continuationToken *string
+
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            &bucket,
+			ContinuationToken: continuationToken,
+			Prefix:            &prefix,
+			Delimiter:         &delimiter,
+			MaxKeys:           &maxKeys,
+		})
+		cancel()
+		if err != nil {
+			return nil, nil, err
+		}
+		contents = append(contents, res.Contents...)
+		commonPrefixes = append(commonPrefixes, res.CommonPrefixes...)
+		continuationToken = res.NextContinuationToken
+
+		if !*res.IsTruncated {
+			break
+		}
+	}
+
+	return contents, commonPrefixes, nil
+}
+
+func hasObjNames(objs []types.Object, names []string) bool {
+	if len(objs) != len(names) {
+		return false
+	}
+
+	for _, obj := range objs {
+		if contains(names, *obj.Key) {
+			continue
+		}
+		return false
+	}
+
+	return true
+}
+
+func hasPrefixName(prefixes []types.CommonPrefix, names []string) bool {
+	if len(prefixes) != len(names) {
+		return false
+	}
+
+	for _, prefix := range prefixes {
+		if contains(names, *prefix.Prefix) {
+			continue
+		}
+		return false
+	}
+
+	return true
+}
+
+func contains(s []string, e string) bool {
+	for _, a := range s {
+		if a == e {
+			return true
+		}
+	}
+	return false
+}
+
+type putObjectOutput struct {
+	csum [32]byte
+	data []byte
+	res  *s3.PutObjectOutput
+}
+
+func putObjectWithData(lgth int64, input *s3.PutObjectInput, client *s3.Client) (*putObjectOutput, error) {
+	data := make([]byte, lgth)
 	rand.Read(data)
-	csum = sha256.Sum256(data)
+	csum := sha256.Sum256(data)
 	r := bytes.NewReader(data)
 	input.Body = r
 
 	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-	_, err = client.PutObject(ctx, input)
+	res, err := client.PutObject(ctx, input)
 	cancel()
+	if err != nil {
+		return nil, err
+	}
 
-	return
+	return &putObjectOutput{
+		csum: csum,
+		data: data,
+		res:  res,
+	}, nil
 }
 
 func createMp(s3client *s3.Client, bucket, key string) (*s3.CreateMultipartUploadOutput, error) {
@@ -302,7 +504,13 @@ func compareMultipartUploads(list1, list2 []types.MultipartUpload) bool {
 		return false
 	}
 	for i, item := range list1 {
-		if *item.Key != *list2[i].Key || *item.UploadId != *list2[i].UploadId {
+		if *item.Key != *list2[i].Key {
+			return false
+		}
+		if *item.UploadId != *list2[i].UploadId {
+			return false
+		}
+		if item.StorageClass != list2[i].StorageClass {
 			return false
 		}
 	}
@@ -360,6 +568,9 @@ func compareGrants(grts1, grts2 []types.Grant) bool {
 		if *grt.Grantee.ID != *grts2[i].Grantee.ID {
 			return false
 		}
+		if grt.Grantee.Type != grts2[i].Grantee.Type {
+			return false
+		}
 	}
 	return true
 }
@@ -381,31 +592,28 @@ func getPtr(str string) *string {
 	return &str
 }
 
+// mp1 needs to be the response from the server
+// mp2 needs to be the expected values
+// The keys from the server are always converted to lowercase
 func areMapsSame(mp1, mp2 map[string]string) bool {
 	if len(mp1) != len(mp2) {
 		return false
 	}
-	for key, val := range mp1 {
-		if mp2[key] != val {
+	for key, val := range mp2 {
+		if mp1[strings.ToLower(key)] != val {
 			return false
 		}
 	}
 	return true
 }
 
-func compareBuckets(list1 []types.Bucket, list2 []s3response.ListAllMyBucketsEntry) bool {
+func compareBuckets(list1 []types.Bucket, list2 []types.Bucket) bool {
 	if len(list1) != len(list2) {
 		return false
 	}
 
-	elementMap := make(map[string]bool)
-
-	for _, elem := range list1 {
-		elementMap[*elem.Name] = true
-	}
-
-	for _, elem := range list2 {
-		if _, found := elementMap[elem.Name]; !found {
+	for i, elem := range list1 {
+		if *elem.Name != *list2[i].Name {
 			return false
 		}
 	}
@@ -413,19 +621,30 @@ func compareBuckets(list1 []types.Bucket, list2 []s3response.ListAllMyBucketsEnt
 	return true
 }
 
-func compareObjects(list1 []string, list2 []types.Object) bool {
+func compareObjects(list1, list2 []types.Object) bool {
 	if len(list1) != len(list2) {
+		fmt.Println("list lengths are not equal")
 		return false
 	}
 
-	elementMap := make(map[string]bool)
-
-	for _, elem := range list1 {
-		elementMap[elem] = true
-	}
-
-	for _, elem := range list2 {
-		if _, found := elementMap[*elem.Key]; !found {
+	for i, obj := range list1 {
+		if *obj.Key != *list2[i].Key {
+			fmt.Printf("keys are not equal: %q != %q\n", *obj.Key, *list2[i].Key)
+			return false
+		}
+		if *obj.ETag != *list2[i].ETag {
+			fmt.Printf("etags are not equal: (%q %q)  %q != %q\n",
+				*obj.Key, *list2[i].Key, *obj.ETag, *list2[i].ETag)
+			return false
+		}
+		if *obj.Size != *list2[i].Size {
+			fmt.Printf("sizes are not equal: (%q %q)  %v != %v\n",
+				*obj.Key, *list2[i].Key, *obj.Size, *list2[i].Size)
+			return false
+		}
+		if obj.StorageClass != list2[i].StorageClass {
+			fmt.Printf("storage classes are not equal: (%q %q)  %v != %v\n",
+				*obj.Key, *list2[i].Key, obj.StorageClass, list2[i].StorageClass)
 			return false
 		}
 	}
@@ -453,59 +672,61 @@ func comparePrefixes(list1 []string, list2 []types.CommonPrefix) bool {
 	return true
 }
 
-func compareDelObjects(list1 []string, list2 []types.DeletedObject) bool {
+func compareDelObjects(list1, list2 []types.DeletedObject) bool {
 	if len(list1) != len(list2) {
 		return false
 	}
 
-	elementMap := make(map[string]bool)
-
-	for _, elem := range list1 {
-		elementMap[elem] = true
-	}
-
-	for _, elem := range list2 {
-		if _, found := elementMap[*elem.Key]; !found {
+	for i, obj := range list1 {
+		if *obj.Key != *list2[i].Key {
 			return false
+		}
+
+		if obj.VersionId != nil {
+			if list2[i].VersionId == nil {
+				return false
+			}
+			if *obj.VersionId != *list2[i].VersionId {
+				return false
+			}
+		}
+		if obj.DeleteMarkerVersionId != nil {
+			if list2[i].DeleteMarkerVersionId == nil {
+				return false
+			}
+			if *obj.DeleteMarkerVersionId != *list2[i].DeleteMarkerVersionId {
+				return false
+			}
+		}
+		if obj.DeleteMarker != nil {
+			if list2[i].DeleteMarker == nil {
+				return false
+			}
+			if *obj.DeleteMarker != *list2[i].DeleteMarker {
+				return false
+			}
 		}
 	}
 
 	return true
 }
 
-func uploadParts(client *s3.Client, size, partCount int, bucket, key, uploadId string) (parts []types.Part, err error) {
-	dr := NewDataReader(size, size)
-	datafile := "rand.data"
-	w, err := os.Create(datafile)
-	if err != nil {
-		return parts, err
-	}
-	defer w.Close()
+func uploadParts(client *s3.Client, size, partCount int64, bucket, key, uploadId string) (parts []types.Part, csum string, err error) {
+	partSize := size / partCount
 
-	_, err = io.Copy(w, dr)
-	if err != nil {
-		return parts, err
-	}
+	hash := sha256.New()
 
-	fileInfo, err := w.Stat()
-	if err != nil {
-		return parts, err
-	}
-
-	partSize := fileInfo.Size() / int64(partCount)
-	var offset int64
-
-	for partNumber := int64(1); partNumber <= int64(partCount); partNumber++ {
+	for partNumber := int64(1); partNumber <= partCount; partNumber++ {
 		partStart := (partNumber - 1) * partSize
 		partEnd := partStart + partSize - 1
-		if partEnd > fileInfo.Size()-1 {
-			partEnd = fileInfo.Size() - 1
+		if partEnd > size-1 {
+			partEnd = size - 1
 		}
+
 		partBuffer := make([]byte, partEnd-partStart+1)
-		_, err := w.ReadAt(partBuffer, partStart)
-		if err != nil {
-			return parts, err
-		}
+		rand.Read(partBuffer)
+		hash.Write(partBuffer)
+
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 		pn := int32(partNumber)
 		out, err := client.UploadPart(ctx, &s3.UploadPartInput{
@@ -517,16 +738,20 @@ func uploadParts(client *s3.Client, size, partCount int, bucket, key, uploadId s
 		})
 		cancel()
 		if err != nil {
-			return parts, err
+			return parts, "", err
 		}
+
 		parts = append(parts, types.Part{
 			ETag:       out.ETag,
 			PartNumber: &pn,
+			Size:       &partSize,
 		})
-		offset += partSize
 	}
 
-	return parts, err
+	sum := hash.Sum(nil)
+	csum = hex.EncodeToString(sum[:])
+
+	return parts, csum, err
 }
 
 type user struct {
@@ -545,8 +770,8 @@ func createUsers(s *S3Conf, users []user) error {
 		if err != nil {
 			return err
 		}
-		if !strings.Contains(string(out), succUsrCrt) && !strings.Contains(string(out), failUsrCrt) {
-			return fmt.Errorf("failed to create user account")
+		if strings.Contains(string(out), adminErrorPrefix) {
+			return fmt.Errorf("failed to create user account: %s", out)
 		}
 	}
 	return nil
@@ -557,8 +782,8 @@ func deleteUser(s *S3Conf, access string) error {
 	if err != nil {
 		return err
 	}
-	if !strings.Contains(string(out), succDeleteUserMsg) {
-		return fmt.Errorf("failed to delete the user account")
+	if strings.Contains(string(out), adminErrorPrefix) {
+		return fmt.Errorf("failed to delete the user account, %s", out)
 	}
 
 	return nil
@@ -570,8 +795,8 @@ func changeBucketsOwner(s *S3Conf, buckets []string, owner string) error {
 		if err != nil {
 			return err
 		}
-		if !strings.Contains(string(out), "Bucket owner has been updated successfully") {
-			return fmt.Errorf(string(out))
+		if strings.Contains(string(out), adminErrorPrefix) {
+			return fmt.Errorf("failed to change the bucket owner: %s", out)
 		}
 	}
 
@@ -665,6 +890,19 @@ func changeBucketObjectLockStatus(client *s3.Client, bucket string, status bool)
 	return nil
 }
 
+func putBucketVersioningStatus(client *s3.Client, bucket string, status types.BucketVersioningStatus) error {
+	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+	_, err := client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+		Bucket: &bucket,
+		VersioningConfiguration: &types.VersioningConfiguration{
+			Status: status,
+		},
+	})
+	cancel()
+
+	return err
+}
+
 func checkWORMProtection(client *s3.Client, bucket, object string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 	_, err := client.PutObject(ctx, &s3.PutObjectInput{
@@ -703,4 +941,146 @@ func checkWORMProtection(client *s3.Client, bucket, object string) error {
 	}
 
 	return nil
+}
+
+func objStrings(objs []types.Object) []string {
+	objStrs := make([]string, len(objs))
+	for i, obj := range objs {
+		objStrs[i] = *obj.Key
+	}
+	return objStrs
+}
+
+func pfxStrings(pfxs []types.CommonPrefix) []string {
+	pfxStrs := make([]string, len(pfxs))
+	for i, pfx := range pfxs {
+		pfxStrs[i] = *pfx.Prefix
+	}
+	return pfxStrs
+}
+
+func createObjVersions(client *s3.Client, bucket, object string, count int) ([]types.ObjectVersion, error) {
+	versions := []types.ObjectVersion{}
+	for i := 0; i < count; i++ {
+		rNumber, err := rand.Int(rand.Reader, big.NewInt(100000))
+		dataLength := rNumber.Int64()
+		if err != nil {
+			return nil, err
+		}
+
+		r, err := putObjectWithData(dataLength, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &object,
+		}, client)
+		if err != nil {
+			return nil, err
+		}
+
+		isLatest := i == count-1
+
+		versions = append(versions, types.ObjectVersion{
+			ETag:         r.res.ETag,
+			IsLatest:     &isLatest,
+			Key:          &object,
+			Size:         &dataLength,
+			VersionId:    r.res.VersionId,
+			StorageClass: types.ObjectVersionStorageClassStandard,
+		})
+	}
+
+	versions = reverseSlice(versions)
+
+	return versions, nil
+}
+
+// ReverseSlice reverses a slice of any type
+func reverseSlice[T any](s []T) []T {
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
+	return s
+}
+
+func compareVersions(v1, v2 []types.ObjectVersion) bool {
+	if len(v1) != len(v2) {
+		return false
+	}
+
+	for i, version := range v1 {
+		if version.Key == nil || v2[i].Key == nil {
+			return false
+		}
+		if *version.Key != *v2[i].Key {
+			return false
+		}
+
+		if version.VersionId == nil || v2[i].VersionId == nil {
+			return false
+		}
+		if *version.VersionId != *v2[i].VersionId {
+			return false
+		}
+
+		if version.IsLatest == nil || v2[i].IsLatest == nil {
+			return false
+		}
+		if *version.IsLatest != *v2[i].IsLatest {
+			return false
+		}
+
+		if version.Size == nil || v2[i].Size == nil {
+			return false
+		}
+		if *version.Size != *v2[i].Size {
+			return false
+		}
+
+		if version.ETag == nil || v2[i].ETag == nil {
+			return false
+		}
+		if *version.ETag != *v2[i].ETag {
+			return false
+		}
+
+		if version.StorageClass != v2[i].StorageClass {
+			return false
+		}
+	}
+
+	return true
+}
+
+func compareDelMarkers(d1, d2 []types.DeleteMarkerEntry) bool {
+	if len(d1) != len(d2) {
+		return false
+	}
+
+	for i, dEntry := range d1 {
+		if dEntry.Key == nil || d2[i].Key == nil {
+			return false
+		}
+		if *dEntry.Key != *d2[i].Key {
+			return false
+		}
+
+		if dEntry.IsLatest == nil || d2[i].IsLatest == nil {
+			return false
+		}
+		if *dEntry.IsLatest != *d2[i].IsLatest {
+			return false
+		}
+
+		if dEntry.VersionId == nil || d2[i].VersionId == nil {
+			return false
+		}
+		if *dEntry.VersionId != *d2[i].VersionId {
+			return false
+		}
+	}
+
+	return true
+}
+
+func getBoolPtr(b bool) *bool {
+	return &b
 }

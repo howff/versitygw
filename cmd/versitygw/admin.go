@@ -19,7 +19,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,6 +29,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/smithy-go"
 	"github.com/urfave/cli/v2"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3response"
@@ -37,6 +38,7 @@ import (
 var (
 	adminAccess   string
 	adminSecret   string
+	adminRegion   string
 	adminEndpoint string
 	allowInsecure bool
 )
@@ -80,10 +82,33 @@ func adminCommand() *cli.Command {
 						Usage:   "groupID for the new user",
 						Aliases: []string{"gi"},
 					},
+				},
+			},
+			{
+				Name:   "update-user",
+				Usage:  "Updates a user account",
+				Action: updateUser,
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:     "access",
+						Usage:    "user access key id to be updated",
+						Required: true,
+						Aliases:  []string{"a"},
+					},
+					&cli.StringFlag{
+						Name:    "secret",
+						Usage:   "secret access key for the new user",
+						Aliases: []string{"s"},
+					},
 					&cli.IntFlag{
-						Name:    "project-id",
-						Usage:   "projectID for the new user",
-						Aliases: []string{"pi"},
+						Name:    "user-id",
+						Usage:   "userID for the new user",
+						Aliases: []string{"ui"},
+					},
+					&cli.IntFlag{
+						Name:    "group-id",
+						Usage:   "groupID for the new user",
+						Aliases: []string{"gi"},
 					},
 				},
 			},
@@ -149,6 +174,14 @@ func adminCommand() *cli.Command {
 				Destination: &adminSecret,
 			},
 			&cli.StringFlag{
+				Name:        "region",
+				Usage:       "admin s3 region string",
+				EnvVars:     []string{"ADMIN_REGION"},
+				Value:       "us-east-1",
+				Destination: &adminRegion,
+				Aliases:     []string{"r"},
+			},
+			&cli.StringFlag{
 				Name:        "endpoint-url",
 				Usage:       "admin apis endpoint url",
 				EnvVars:     []string{"ADMIN_ENDPOINT_URL"},
@@ -176,41 +209,40 @@ func initHTTPClient() *http.Client {
 
 func createUser(ctx *cli.Context) error {
 	access, secret, role := ctx.String("access"), ctx.String("secret"), ctx.String("role")
-	userID, groupID, projectID := ctx.Int("user-id"), ctx.Int("group-id"), ctx.Int("projectID")
+	userID, groupID := ctx.Int("user-id"), ctx.Int("group-id")
 	if access == "" || secret == "" {
-		return fmt.Errorf("invalid input parameters for the new user")
+		return fmt.Errorf("invalid input parameters for the new user access/secret keys")
 	}
 	if role != string(auth.RoleAdmin) && role != string(auth.RoleUser) && role != string(auth.RoleUserPlus) {
 		return fmt.Errorf("invalid input parameter for role: %v", role)
 	}
 
 	acc := auth.Account{
-		Access:    access,
-		Secret:    secret,
-		Role:      auth.Role(role),
-		UserID:    userID,
-		GroupID:   groupID,
-		ProjectID: projectID,
+		Access:  access,
+		Secret:  secret,
+		Role:    auth.Role(role),
+		UserID:  userID,
+		GroupID: groupID,
 	}
 
-	accJson, err := json.Marshal(acc)
+	accxml, err := xml.Marshal(acc)
 	if err != nil {
 		return fmt.Errorf("failed to parse user data: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPatch, fmt.Sprintf("%v/create-user", adminEndpoint), bytes.NewBuffer(accJson))
+	req, err := http.NewRequest(http.MethodPatch, fmt.Sprintf("%v/create-user", adminEndpoint), bytes.NewBuffer(accxml))
 	if err != nil {
 		return fmt.Errorf("failed to send the request: %w", err)
 	}
 
 	signer := v4.NewSigner()
 
-	hashedPayload := sha256.Sum256(accJson)
+	hashedPayload := sha256.Sum256(accxml)
 	hexPayload := hex.EncodeToString(hashedPayload[:])
 
 	req.Header.Set("X-Amz-Content-Sha256", hexPayload)
 
-	signErr := signer.SignHTTP(req.Context(), aws.Credentials{AccessKeyID: adminAccess, SecretAccessKey: adminSecret}, req, hexPayload, "s3", region, time.Now())
+	signErr := signer.SignHTTP(req.Context(), aws.Credentials{AccessKeyID: adminAccess, SecretAccessKey: adminSecret}, req, hexPayload, "s3", adminRegion, time.Now())
 	if signErr != nil {
 		return fmt.Errorf("failed to sign the request: %w", err)
 	}
@@ -229,10 +261,8 @@ func createUser(ctx *cli.Context) error {
 	}
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("%s", body)
+		return parseApiError(body)
 	}
-
-	fmt.Printf("%s\n", body)
 
 	return nil
 }
@@ -240,7 +270,7 @@ func createUser(ctx *cli.Context) error {
 func deleteUser(ctx *cli.Context) error {
 	access := ctx.String("access")
 	if access == "" {
-		return fmt.Errorf("invalid input parameter for the new user")
+		return fmt.Errorf("invalid input parameter for the user access key")
 	}
 
 	req, err := http.NewRequest(http.MethodPatch, fmt.Sprintf("%v/delete-user?access=%v", adminEndpoint, access), nil)
@@ -255,7 +285,7 @@ func deleteUser(ctx *cli.Context) error {
 
 	req.Header.Set("X-Amz-Content-Sha256", hexPayload)
 
-	signErr := signer.SignHTTP(req.Context(), aws.Credentials{AccessKeyID: adminAccess, SecretAccessKey: adminSecret}, req, hexPayload, "s3", region, time.Now())
+	signErr := signer.SignHTTP(req.Context(), aws.Credentials{AccessKeyID: adminAccess, SecretAccessKey: adminSecret}, req, hexPayload, "s3", adminRegion, time.Now())
 	if signErr != nil {
 		return fmt.Errorf("failed to sign the request: %w", err)
 	}
@@ -274,10 +304,63 @@ func deleteUser(ctx *cli.Context) error {
 	}
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("%s", body)
+		return parseApiError(body)
 	}
 
-	fmt.Printf("%s\n", body)
+	return nil
+}
+
+func updateUser(ctx *cli.Context) error {
+	access, secret, userId, groupId := ctx.String("access"), ctx.String("secret"), ctx.Int("user-id"), ctx.Int("group-id")
+	props := auth.MutableProps{}
+	if ctx.IsSet("secret") {
+		props.Secret = &secret
+	}
+	if ctx.IsSet("user-id") {
+		props.UserID = &userId
+	}
+	if ctx.IsSet("group-id") {
+		props.GroupID = &groupId
+	}
+
+	propsxml, err := xml.Marshal(props)
+	if err != nil {
+		return fmt.Errorf("failed to parse user attributes: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPatch, fmt.Sprintf("%v/update-user?access=%v", adminEndpoint, access), bytes.NewBuffer(propsxml))
+	if err != nil {
+		return fmt.Errorf("failed to send the request: %w", err)
+	}
+
+	signer := v4.NewSigner()
+
+	hashedPayload := sha256.Sum256(propsxml)
+	hexPayload := hex.EncodeToString(hashedPayload[:])
+
+	req.Header.Set("X-Amz-Content-Sha256", hexPayload)
+
+	signErr := signer.SignHTTP(req.Context(), aws.Credentials{AccessKeyID: adminAccess, SecretAccessKey: adminSecret}, req, hexPayload, "s3", adminRegion, time.Now())
+	if signErr != nil {
+		return fmt.Errorf("failed to sign the request: %w", err)
+	}
+
+	client := initHTTPClient()
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send the request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode >= 400 {
+		return parseApiError(body)
+	}
 
 	return nil
 }
@@ -295,7 +378,7 @@ func listUsers(ctx *cli.Context) error {
 
 	req.Header.Set("X-Amz-Content-Sha256", hexPayload)
 
-	signErr := signer.SignHTTP(req.Context(), aws.Credentials{AccessKeyID: adminAccess, SecretAccessKey: adminSecret}, req, hexPayload, "s3", region, time.Now())
+	signErr := signer.SignHTTP(req.Context(), aws.Credentials{AccessKeyID: adminAccess, SecretAccessKey: adminSecret}, req, hexPayload, "s3", adminRegion, time.Now())
 	if signErr != nil {
 		return fmt.Errorf("failed to sign the request: %w", err)
 	}
@@ -314,15 +397,15 @@ func listUsers(ctx *cli.Context) error {
 	}
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("%s", body)
+		return parseApiError(body)
 	}
 
-	var accs []auth.Account
-	if err := json.Unmarshal(body, &accs); err != nil {
+	var accs auth.ListUserAccountsResult
+	if err := xml.Unmarshal(body, &accs); err != nil {
 		return err
 	}
 
-	printAcctTable(accs)
+	printAcctTable(accs.Accounts)
 
 	return nil
 }
@@ -339,10 +422,10 @@ const (
 func printAcctTable(accs []auth.Account) {
 	w := new(tabwriter.Writer)
 	w.Init(os.Stdout, minwidth, tabwidth, padding, padchar, flags)
-	fmt.Fprintln(w, "Account\tRole\tUserID\tGroupID\tProjectID")
-	fmt.Fprintln(w, "-------\t----\t------\t-------\t---------")
+	fmt.Fprintln(w, "Account\tRole\tUserID\tGroupID")
+	fmt.Fprintln(w, "-------\t----\t------\t-------")
 	for _, acc := range accs {
-		fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\n", acc.Access, acc.Role, acc.UserID, acc.GroupID, acc.ProjectID)
+		fmt.Fprintf(w, "%v\t%v\t%v\t%v\n", acc.Access, acc.Role, acc.UserID, acc.GroupID)
 	}
 	fmt.Fprintln(w)
 	w.Flush()
@@ -362,7 +445,7 @@ func changeBucketOwner(ctx *cli.Context) error {
 
 	req.Header.Set("X-Amz-Content-Sha256", hexPayload)
 
-	signErr := signer.SignHTTP(req.Context(), aws.Credentials{AccessKeyID: adminAccess, SecretAccessKey: adminSecret}, req, hexPayload, "s3", region, time.Now())
+	signErr := signer.SignHTTP(req.Context(), aws.Credentials{AccessKeyID: adminAccess, SecretAccessKey: adminSecret}, req, hexPayload, "s3", adminRegion, time.Now())
 	if signErr != nil {
 		return fmt.Errorf("failed to sign the request: %w", err)
 	}
@@ -381,10 +464,8 @@ func changeBucketOwner(ctx *cli.Context) error {
 	}
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("%s", body)
+		return parseApiError(body)
 	}
-
-	fmt.Println(string(body))
 
 	return nil
 }
@@ -414,7 +495,7 @@ func listBuckets(ctx *cli.Context) error {
 
 	req.Header.Set("X-Amz-Content-Sha256", hexPayload)
 
-	signErr := signer.SignHTTP(req.Context(), aws.Credentials{AccessKeyID: adminAccess, SecretAccessKey: adminSecret}, req, hexPayload, "s3", region, time.Now())
+	signErr := signer.SignHTTP(req.Context(), aws.Credentials{AccessKeyID: adminAccess, SecretAccessKey: adminSecret}, req, hexPayload, "s3", adminRegion, time.Now())
 	if signErr != nil {
 		return fmt.Errorf("failed to sign the request: %w", err)
 	}
@@ -433,15 +514,26 @@ func listBuckets(ctx *cli.Context) error {
 	}
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("%s", body)
+		return parseApiError(body)
 	}
 
-	var buckets []s3response.Bucket
-	if err := json.Unmarshal(body, &buckets); err != nil {
+	var result s3response.ListBucketsResult
+	if err := xml.Unmarshal(body, &result); err != nil {
 		return err
 	}
 
-	printBuckets(buckets)
+	printBuckets(result.Buckets)
 
 	return nil
+}
+
+func parseApiError(body []byte) error {
+	var apiErr smithy.GenericAPIError
+	err := xml.Unmarshal(body, &apiErr)
+	if err != nil {
+		apiErr.Code = "InternalServerError"
+		apiErr.Message = err.Error()
+	}
+
+	return &apiErr
 }

@@ -1,3 +1,17 @@
+// Copyright 2023 Versity Software
+// This file is licensed under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package integration
 
 import (
@@ -17,15 +31,17 @@ import (
 )
 
 type S3Conf struct {
-	awsID           string
-	awsSecret       string
-	awsRegion       string
-	endpoint        string
-	checksumDisable bool
-	pathStyle       bool
-	PartSize        int64
-	Concurrency     int
-	debug           bool
+	awsID             string
+	awsSecret         string
+	awsRegion         string
+	endpoint          string
+	checksumDisable   bool
+	pathStyle         bool
+	PartSize          int64
+	Concurrency       int
+	debug             bool
+	versioningEnabled bool
+	azureTests        bool
 }
 
 func NewS3Conf(opts ...Option) *S3Conf {
@@ -66,6 +82,12 @@ func WithConcurrency(c int) Option {
 func WithDebug() Option {
 	return func(s *S3Conf) { s.debug = true }
 }
+func WithVersioningEnabled() Option {
+	return func(s *S3Conf) { s.versioningEnabled = true }
+}
+func WithAzureMode() Option {
+	return func(s *S3Conf) { s.azureTests = true }
+}
 
 func (c *S3Conf) getCreds() credentials.StaticCredentialsProvider {
 	// TODO support token/IAM
@@ -79,13 +101,8 @@ func (c *S3Conf) getCreds() credentials.StaticCredentialsProvider {
 	return credentials.NewStaticCredentialsProvider(c.awsID, c.awsSecret, "")
 }
 
-func (c *S3Conf) ResolveEndpoint(service, region string, options ...interface{}) (aws.Endpoint, error) {
-	return aws.Endpoint{
-		PartitionID:       "aws",
-		URL:               c.endpoint,
-		SigningRegion:     c.awsRegion,
-		HostnameImmutable: true,
-	}, nil
+func (c *S3Conf) GetClient() *s3.Client {
+	return s3.NewFromConfig(c.Config())
 }
 
 func (c *S3Conf) Config() aws.Config {
@@ -98,11 +115,7 @@ func (c *S3Conf) Config() aws.Config {
 		config.WithRegion(c.awsRegion),
 		config.WithCredentialsProvider(creds),
 		config.WithHTTPClient(client),
-	}
-
-	if c.endpoint != "" && c.endpoint != "aws" {
-		opts = append(opts,
-			config.WithEndpointResolverWithOptions(c))
+		config.WithRetryMaxAttempts(1),
 	}
 
 	if c.checksumDisable {
@@ -121,11 +134,15 @@ func (c *S3Conf) Config() aws.Config {
 		log.Fatalln("error:", err)
 	}
 
+	if c.endpoint != "" && c.endpoint != "aws" {
+		cfg.BaseEndpoint = &c.endpoint
+	}
+
 	return cfg
 }
 
 func (c *S3Conf) UploadData(r io.Reader, bucket, object string) error {
-	uploader := manager.NewUploader(s3.NewFromConfig(c.Config()))
+	uploader := manager.NewUploader(c.GetClient())
 	uploader.PartSize = c.PartSize
 	uploader.Concurrency = c.Concurrency
 
@@ -140,7 +157,7 @@ func (c *S3Conf) UploadData(r io.Reader, bucket, object string) error {
 }
 
 func (c *S3Conf) DownloadData(w io.WriterAt, bucket, object string) (int64, error) {
-	downloader := manager.NewDownloader(s3.NewFromConfig(c.Config()))
+	downloader := manager.NewDownloader(c.GetClient())
 	downloader.PartSize = c.PartSize
 	downloader.Concurrency = c.Concurrency
 

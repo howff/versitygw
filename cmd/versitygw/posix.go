@@ -16,6 +16,8 @@ package main
 
 import (
 	"fmt"
+	"io/fs"
+	"math"
 
 	"github.com/urfave/cli/v2"
 	"github.com/versity/versitygw/backend/meta"
@@ -25,6 +27,9 @@ import (
 var (
 	chownuid, chowngid bool
 	metadata           string
+	bucketlinks        bool
+	versioningDir      string
+	dirPerms           uint
 )
 
 func posixCommand() *cli.Command {
@@ -61,6 +66,26 @@ will be translated into the file /mnt/fs/gwroot/mybucket/a/b/c/myobject`,
 				EnvVars:     []string{"VGW_META_STORE"},
 				Destination: &metadata,
 			},
+			&cli.BoolFlag{
+				Name:        "bucketlinks",
+				Usage:       "allow symlinked directories at bucket level to be treated as buckets",
+				EnvVars:     []string{"VGW_BUCKET_LINKS"},
+				Destination: &bucketlinks,
+			},
+			&cli.StringFlag{
+				Name:        "versioning-dir",
+				Usage:       "the directory path to enable bucket versioning",
+				EnvVars:     []string{"VGW_VERSIONING_DIR"},
+				Destination: &versioningDir,
+			},
+			&cli.UintFlag{
+				Name:        "dir-perms",
+				Usage:       "default directory permissions for new directories",
+				EnvVars:     []string{"VGW_DIR_PERMS"},
+				Destination: &dirPerms,
+				DefaultText: "0755",
+				Value:       0755,
+			},
 		},
 	}
 }
@@ -75,6 +100,9 @@ func runPosix(ctx *cli.Context) error {
 	opts := posix.PosixOpts{
 		ChownUID: chownuid,
 		ChownGID: chowngid,
+		BucketLinks:   bucketlinks,
+		VersioningDir: versioningDir,
+		NewDirPerm:    fs.FileMode(dirPerms),
 	}
 
 	var ms meta.MetadataStorer
@@ -90,6 +118,10 @@ func runPosix(ctx *cli.Context) error {
 		}
 	default:
 		return fmt.Errorf("unknown metadata storage option: %s", metadata)
+	}
+
+	if dirPerms > math.MaxUint32 {
+		return fmt.Errorf("invalid directory permissions: %d", dirPerms)
 	}
 
 	be, err := posix.New(gwroot, ms, opts)

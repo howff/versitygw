@@ -16,107 +16,188 @@ package controllers
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"net/http"
+	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/gofiber/fiber/v2"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/backend"
+	"github.com/versity/versitygw/metrics"
+	"github.com/versity/versitygw/s3err"
+	"github.com/versity/versitygw/s3log"
+	"github.com/versity/versitygw/s3response"
 )
 
 type AdminController struct {
 	iam auth.IAMService
 	be  backend.Backend
+	l   s3log.AuditLogger
 }
 
-func NewAdminController(iam auth.IAMService, be backend.Backend) AdminController {
-	return AdminController{iam: iam, be: be}
+func NewAdminController(iam auth.IAMService, be backend.Backend, l s3log.AuditLogger) AdminController {
+	return AdminController{iam: iam, be: be, l: l}
 }
 
 func (c AdminController) CreateUser(ctx *fiber.Ctx) error {
-	acct := ctx.Locals("account").(auth.Account)
-	if acct.Role != "admin" {
-		return fmt.Errorf("access denied: only admin users have access to this resource")
-	}
 	var usr auth.Account
-	err := json.Unmarshal(ctx.Body(), &usr)
+	err := xml.Unmarshal(ctx.Body(), &usr)
 	if err != nil {
-		return fmt.Errorf("failed to parse request body: %w", err)
+		return SendResponse(ctx, s3err.GetAPIError(s3err.ErrMalformedXML),
+			&MetaOpts{
+				Logger: c.l,
+				Action: metrics.ActionAdminCreateUser,
+			})
 	}
 
-	if usr.Role != auth.RoleAdmin && usr.Role != auth.RoleUser && usr.Role != auth.RoleUserPlus {
-		return fmt.Errorf("invalid parameters: user role have to be one of the following: 'user', 'admin', 'userplus'")
+	if !usr.Role.IsValid() {
+		return SendResponse(ctx, s3err.GetAPIError(s3err.ErrAdminInvalidUserRole),
+			&MetaOpts{
+				Logger: c.l,
+				Action: metrics.ActionAdminCreateUser,
+			})
 	}
 
 	err = c.iam.CreateAccount(usr)
 	if err != nil {
-		return fmt.Errorf("failed to create user: %w", err)
+		if strings.Contains(err.Error(), "user already exists") {
+			err = s3err.GetAPIError(s3err.ErrAdminUserExists)
+		}
+
+		return SendResponse(ctx, err,
+			&MetaOpts{
+				Logger: c.l,
+				Action: metrics.ActionAdminCreateUser,
+			})
 	}
 
-	return ctx.SendString("The user has been created successfully")
+	return SendResponse(ctx, nil,
+		&MetaOpts{
+			Logger: c.l,
+			Action: metrics.ActionAdminCreateUser,
+			Status: http.StatusCreated,
+		})
+}
+
+func (c AdminController) UpdateUser(ctx *fiber.Ctx) error {
+	access := ctx.Query("access")
+	if access == "" {
+		return SendResponse(ctx, s3err.GetAPIError(s3err.ErrAdminMissingUserAcess),
+			&MetaOpts{
+				Logger: c.l,
+				Action: metrics.ActionAdminUpdateUser,
+			})
+	}
+
+	var props auth.MutableProps
+	if err := xml.Unmarshal(ctx.Body(), &props); err != nil {
+		return SendResponse(ctx, s3err.GetAPIError(s3err.ErrMalformedXML),
+			&MetaOpts{
+				Logger: c.l,
+				Action: metrics.ActionAdminUpdateUser,
+			})
+	}
+
+	err := c.iam.UpdateUserAccount(access, props)
+	if err != nil {
+		if strings.Contains(err.Error(), "user not found") {
+			err = s3err.GetAPIError(s3err.ErrAdminUserNotFound)
+		}
+
+		return SendResponse(ctx, err,
+			&MetaOpts{
+				Logger: c.l,
+				Action: metrics.ActionAdminUpdateUser,
+			})
+	}
+
+	return SendResponse(ctx, nil,
+		&MetaOpts{
+			Logger: c.l,
+			Action: metrics.ActionAdminUpdateUser,
+		})
 }
 
 func (c AdminController) DeleteUser(ctx *fiber.Ctx) error {
 	access := ctx.Query("access")
-	acct := ctx.Locals("account").(auth.Account)
-	if acct.Role != "admin" {
-		return fmt.Errorf("access denied: only admin users have access to this resource")
-	}
 
 	err := c.iam.DeleteUserAccount(access)
-	if err != nil {
-		return err
-	}
-
-	return ctx.SendString("The user has been deleted successfully")
+	return SendResponse(ctx, err,
+		&MetaOpts{
+			Logger: c.l,
+			Action: metrics.ActionAdminDeleteUser,
+		})
 }
 
 func (c AdminController) ListUsers(ctx *fiber.Ctx) error {
-	acct := ctx.Locals("account").(auth.Account)
-	if acct.Role != "admin" {
-		return fmt.Errorf("access denied: only admin users have access to this resource")
-	}
 	accs, err := c.iam.ListUserAccounts()
-	if err != nil {
-		return err
-	}
-
-	return ctx.JSON(accs)
+	return SendXMLResponse(ctx,
+		auth.ListUserAccountsResult{
+			Accounts: accs,
+		}, err,
+		&MetaOpts{
+			Logger: c.l,
+			Action: metrics.ActionAdminListUsers,
+		})
 }
 
 func (c AdminController) ChangeBucketOwner(ctx *fiber.Ctx) error {
-	acct := ctx.Locals("account").(auth.Account)
-	if acct.Role != "admin" {
-		return fmt.Errorf("access denied: only admin users have access to this resource")
-	}
 	owner := ctx.Query("owner")
 	bucket := ctx.Query("bucket")
 
 	accs, err := auth.CheckIfAccountsExist([]string{owner}, c.iam)
 	if err != nil {
-		return err
+		return SendResponse(ctx, err,
+			&MetaOpts{
+				Logger: c.l,
+				Action: metrics.ActionAdminChangeBucketOwner,
+			})
 	}
 	if len(accs) > 0 {
-		return fmt.Errorf("user specified as the new bucket owner does not exist")
+		return SendResponse(ctx, s3err.GetAPIError(s3err.ErrAdminUserNotFound),
+			&MetaOpts{
+				Logger: c.l,
+				Action: metrics.ActionAdminChangeBucketOwner,
+			})
 	}
 
-	err = c.be.ChangeBucketOwner(ctx.Context(), bucket, owner)
+	acl := auth.ACL{
+		Owner: owner,
+		Grantees: []auth.Grantee{
+			{
+				Permission: types.PermissionFullControl,
+				Access:     owner,
+				Type:       types.TypeCanonicalUser,
+			},
+		},
+	}
+
+	aclParsed, err := json.Marshal(acl)
 	if err != nil {
-		return err
+		return SendResponse(ctx, fmt.Errorf("failed to marshal the bucket acl: %w", err),
+			&MetaOpts{
+				Logger: c.l,
+				Action: metrics.ActionAdminChangeBucketOwner,
+			})
 	}
 
-	return ctx.Status(201).SendString("Bucket owner has been updated successfully")
+	err = c.be.ChangeBucketOwner(ctx.Context(), bucket, aclParsed)
+	return SendResponse(ctx, err,
+		&MetaOpts{
+			Logger: c.l,
+			Action: metrics.ActionAdminChangeBucketOwner,
+		})
 }
 
 func (c AdminController) ListBuckets(ctx *fiber.Ctx) error {
-	acct := ctx.Locals("account").(auth.Account)
-	if acct.Role != "admin" {
-		return fmt.Errorf("access denied: only admin users have access to this resource")
-	}
-
 	buckets, err := c.be.ListBucketsAndOwners(ctx.Context())
-	if err != nil {
-		return err
-	}
-
-	return ctx.JSON(buckets)
+	return SendXMLResponse(ctx,
+		s3response.ListBucketsResult{
+			Buckets: buckets,
+		}, err, &MetaOpts{
+			Logger: c.l,
+			Action: metrics.ActionAdminListBuckets,
+		})
 }

@@ -15,36 +15,50 @@
 package backend_test
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
 	"io/fs"
+	"sync"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/versity/versitygw/backend"
+	"github.com/versity/versitygw/s3response"
 )
 
 type walkTest struct {
-	fsys     fs.FS
-	expected backend.WalkResults
-	getobj   backend.GetObjFunc
+	fsys   fs.FS
+	getobj backend.GetObjFunc
+	cases  []testcase
 }
 
-func getObj(path string, d fs.DirEntry) (types.Object, error) {
+type testcase struct {
+	name      string
+	prefix    string
+	delimiter string
+	marker    string
+	maxObjs   int32
+	expected  backend.WalkResults
+}
+
+func getObj(path string, d fs.DirEntry) (s3response.Object, error) {
 	if d.IsDir() {
 		etag := getMD5(path)
 
 		fi, err := d.Info()
 		if err != nil {
-			return types.Object{}, fmt.Errorf("get fileinfo: %w", err)
+			return s3response.Object{}, fmt.Errorf("get fileinfo: %w", err)
 		}
+		mtime := fi.ModTime()
 
-		return types.Object{
+		return s3response.Object{
 			ETag:         &etag,
 			Key:          &path,
-			LastModified: backend.GetTimePtr(fi.ModTime()),
+			LastModified: &mtime,
 		}, nil
 	}
 
@@ -52,15 +66,16 @@ func getObj(path string, d fs.DirEntry) (types.Object, error) {
 
 	fi, err := d.Info()
 	if err != nil {
-		return types.Object{}, fmt.Errorf("get fileinfo: %w", err)
+		return s3response.Object{}, fmt.Errorf("get fileinfo: %w", err)
 	}
 
 	size := fi.Size()
+	mtime := fi.ModTime()
 
-	return types.Object{
+	return s3response.Object{
 		ETag:         &etag,
 		Key:          &path,
-		LastModified: backend.GetTimePtr(fi.ModTime()),
+		LastModified: &mtime,
 		Size:         &size,
 	}, nil
 }
@@ -82,50 +97,154 @@ func TestWalk(t *testing.T) {
 				"photos/2006/February/sample3.jpg": {},
 				"photos/2006/February/sample4.jpg": {},
 			},
-			expected: backend.WalkResults{
-				CommonPrefixes: []types.CommonPrefix{{
-					Prefix: backend.GetStringPtr("photos/"),
-				}},
-				Objects: []types.Object{{
-					Key: backend.GetStringPtr("sample.jpg"),
-				}},
-			},
 			getobj: getObj,
+			cases: []testcase{
+				{
+					name:      "aws example",
+					delimiter: "/",
+					maxObjs:   1000,
+					expected: backend.WalkResults{
+						CommonPrefixes: []types.CommonPrefix{{
+							Prefix: backend.GetPtrFromString("photos/"),
+						}},
+						Objects: []s3response.Object{{
+							Key: backend.GetPtrFromString("sample.jpg"),
+						}},
+					},
+				},
+			},
 		},
 		{
 			// test case single dir/single file
 			fsys: fstest.MapFS{
 				"test/file": {},
 			},
-			expected: backend.WalkResults{
-				CommonPrefixes: []types.CommonPrefix{{
-					Prefix: backend.GetStringPtr("test/"),
-				}},
-				Objects: []types.Object{},
+			getobj: getObj,
+			cases: []testcase{
+				{
+					name:      "single dir single file",
+					delimiter: "/",
+					maxObjs:   1000,
+					expected: backend.WalkResults{
+						CommonPrefixes: []types.CommonPrefix{{
+							Prefix: backend.GetPtrFromString("test/"),
+						}},
+						Objects: []s3response.Object{},
+					},
+				},
+			},
+		},
+		{
+			// non-standard delimiter
+			fsys: fstest.MapFS{
+				"photo|s/200|6/Januar|y/sampl|e1.jpg": {},
+				"photo|s/200|6/Januar|y/sampl|e2.jpg": {},
+				"photo|s/200|6/Januar|y/sampl|e3.jpg": {},
 			},
 			getobj: getObj,
+			cases: []testcase{
+				{
+					name:      "different delimiter 1",
+					delimiter: "|",
+					maxObjs:   1000,
+					expected: backend.WalkResults{
+						CommonPrefixes: []types.CommonPrefix{{
+							Prefix: backend.GetPtrFromString("photo|"),
+						}},
+					},
+				},
+				{
+					name:      "different delimiter 2",
+					delimiter: "|",
+					maxObjs:   1000,
+					prefix:    "photo|",
+					expected: backend.WalkResults{
+						CommonPrefixes: []types.CommonPrefix{{
+							Prefix: backend.GetPtrFromString("photo|s/200|"),
+						}},
+					},
+				},
+				{
+					name:      "different delimiter 3",
+					delimiter: "|",
+					maxObjs:   1000,
+					prefix:    "photo|s/200|",
+					expected: backend.WalkResults{
+						CommonPrefixes: []types.CommonPrefix{{
+							Prefix: backend.GetPtrFromString("photo|s/200|6/Januar|"),
+						}},
+					},
+				},
+				{
+					name:      "different delimiter 4",
+					delimiter: "|",
+					maxObjs:   1000,
+					prefix:    "photo|s/200|",
+					expected: backend.WalkResults{
+						CommonPrefixes: []types.CommonPrefix{{
+							Prefix: backend.GetPtrFromString("photo|s/200|6/Januar|"),
+						}},
+					},
+				},
+				{
+					name:      "different delimiter 5",
+					delimiter: "|",
+					maxObjs:   1000,
+					prefix:    "photo|s/200|6/Januar|",
+					expected: backend.WalkResults{
+						CommonPrefixes: []types.CommonPrefix{{
+							Prefix: backend.GetPtrFromString("photo|s/200|6/Januar|y/sampl|"),
+						}},
+					},
+				},
+				{
+					name:      "different delimiter 6",
+					delimiter: "|",
+					maxObjs:   1000,
+					prefix:    "photo|s/200|6/Januar|y/sampl|",
+					expected: backend.WalkResults{
+						Objects: []s3response.Object{
+							{
+								Key: backend.GetPtrFromString("photo|s/200|6/Januar|y/sampl|e1.jpg"),
+							},
+							{
+								Key: backend.GetPtrFromString("photo|s/200|6/Januar|y/sampl|e2.jpg"),
+							},
+							{
+								Key: backend.GetPtrFromString("photo|s/200|6/Januar|y/sampl|e3.jpg"),
+							},
+						},
+					},
+				},
+			},
 		},
 	}
 
 	for _, tt := range tests {
-		res, err := backend.Walk(tt.fsys, "", "/", "", 1000, tt.getobj, []string{}, []string{})
-		if err != nil {
-			t.Fatalf("walk: %v", err)
-		}
+		for _, tc := range tt.cases {
+			res, err := backend.Walk(context.Background(),
+				tt.fsys, tc.prefix, tc.delimiter, tc.marker, tc.maxObjs,
+				tt.getobj, []string{}, []string{})
+			if err != nil {
+				t.Errorf("tc.name: walk: %v", err)
+			}
 
-		compareResults(res, tt.expected, t)
+			compareResults(tc.name, res, tc.expected, t)
+		}
 	}
 }
 
-func compareResults(got, wanted backend.WalkResults, t *testing.T) {
+func compareResults(name string, got, wanted backend.WalkResults, t *testing.T) {
 	if !compareCommonPrefix(got.CommonPrefixes, wanted.CommonPrefixes) {
-		t.Errorf("unexpected common prefix, got %v wanted %v",
+		t.Errorf("%v: unexpected common prefix, got %v wanted %v",
+			name,
 			printCommonPrefixes(got.CommonPrefixes),
 			printCommonPrefixes(wanted.CommonPrefixes))
 	}
 
 	if !compareObjects(got.Objects, wanted.Objects) {
-		t.Errorf("unexpected object, got %v wanted %v",
+		t.Errorf("%v: unexpected object, got %v wanted %v",
+			name,
 			printObjects(got.Objects),
 			printObjects(wanted.Objects))
 	}
@@ -168,7 +287,7 @@ func printCommonPrefixes(list []types.CommonPrefix) string {
 	return res + "]"
 }
 
-func compareObjects(a, b []types.Object) bool {
+func compareObjects(a, b []s3response.Object) bool {
 	if len(a) == 0 && len(b) == 0 {
 		return true
 	}
@@ -184,7 +303,7 @@ func compareObjects(a, b []types.Object) bool {
 	return false
 }
 
-func containsObject(c types.Object, list []types.Object) bool {
+func containsObject(c s3response.Object, list []s3response.Object) bool {
 	for _, cp := range list {
 		if *c.Key == *cp.Key {
 			return true
@@ -193,14 +312,67 @@ func containsObject(c types.Object, list []types.Object) bool {
 	return false
 }
 
-func printObjects(list []types.Object) string {
+func printObjects(list []s3response.Object) string {
 	res := "["
 	for _, cp := range list {
-		if res == "[" {
-			res = res + *cp.Key
+		var key string
+		if cp.Key == nil {
+			key = "<nil>"
 		} else {
-			res = res + ", " + *cp.Key
+			key = *cp.Key
+		}
+		if res == "[" {
+			res = res + key
+		} else {
+			res = res + ", " + key
 		}
 	}
 	return res + "]"
+}
+
+type slowFS struct {
+	fstest.MapFS
+}
+
+const (
+	readDirPause = 100 * time.Millisecond
+
+	// walkTimeOut should be less than the tree traversal time
+	// which is the readdirPause time * the number of directories
+	walkTimeOut = 500 * time.Millisecond
+)
+
+func (s *slowFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	time.Sleep(readDirPause)
+	return s.MapFS.ReadDir(name)
+}
+
+func TestWalkStop(t *testing.T) {
+	s := &slowFS{MapFS: fstest.MapFS{
+		"/a/b/c/d/e/f/g/h/i/g/k/l/m/n": &fstest.MapFile{},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), walkTimeOut)
+	defer cancel()
+
+	var err error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err = backend.Walk(ctx, s, "", "/", "", 1000,
+			func(path string, d fs.DirEntry) (s3response.Object, error) {
+				return s3response.Object{}, nil
+			}, []string{})
+	}()
+
+	select {
+	case <-time.After(1 * time.Second):
+		t.Fatalf("walk is not terminated in time")
+	case <-ctx.Done():
+	}
+	wg.Wait()
+	if err != ctx.Err() {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }

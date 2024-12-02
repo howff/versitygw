@@ -22,20 +22,22 @@ import (
 )
 
 var (
-	awsID           string
-	awsSecret       string
-	endpoint        string
-	prefix          string
-	dstBucket       string
-	partSize        int64
-	objSize         int64
-	concurrency     int
-	files           int
-	totalReqs       int
-	upload          bool
-	download        bool
-	pathStyle       bool
-	checksumDisable bool
+	awsID             string
+	awsSecret         string
+	endpoint          string
+	prefix            string
+	dstBucket         string
+	partSize          int64
+	objSize           int64
+	concurrency       int
+	files             int
+	totalReqs         int
+	upload            bool
+	download          bool
+	pathStyle         bool
+	checksumDisable   bool
+	versioningEnabled bool
+	azureTests        bool
 )
 
 func testCommand() *cli.Command {
@@ -87,11 +89,33 @@ func initTestCommands() []*cli.Command {
 			Usage:       "Tests the full flow of gateway.",
 			Description: `Runs all the available tests to test the full flow of the gateway.`,
 			Action:      getAction(integration.TestFullFlow),
+			Flags: []cli.Flag{
+				&cli.BoolFlag{
+					Name:        "versioning-enabled",
+					Usage:       "Test the bucket object versioning, if the versioning is enabled",
+					Destination: &versioningEnabled,
+					Aliases:     []string{"vs"},
+				},
+				&cli.BoolFlag{
+					Name:        "azure-test-mode",
+					Usage:       "Skips tests that are not supported by Azure",
+					Destination: &azureTests,
+					Aliases:     []string{"azure"},
+				},
+			},
 		},
 		{
 			Name:   "posix",
 			Usage:  "Tests posix specific features",
 			Action: getAction(integration.TestPosix),
+			Flags: []cli.Flag{
+				&cli.BoolFlag{
+					Name:        "versioning-enabled",
+					Usage:       "Test posix when versioning is enabled",
+					Destination: &versioningEnabled,
+					Aliases:     []string{"vs"},
+				},
+			},
 		},
 		{
 			Name:   "iam",
@@ -276,6 +300,12 @@ func getAction(tf testFunc) func(*cli.Context) error {
 		if debug {
 			opts = append(opts, integration.WithDebug())
 		}
+		if versioningEnabled {
+			opts = append(opts, integration.WithVersioningEnabled())
+		}
+		if azureTests {
+			opts = append(opts, integration.WithAzureMode())
+		}
 
 		s := integration.NewS3Conf(opts...)
 		tf(s)
@@ -307,10 +337,21 @@ func extractIntTests() (commands []*cli.Command) {
 				if debug {
 					opts = append(opts, integration.WithDebug())
 				}
+				if versioningEnabled {
+					opts = append(opts, integration.WithVersioningEnabled())
+				}
 
 				s := integration.NewS3Conf(opts...)
 				err := testFunc(s)
 				return err
+			},
+			Flags: []cli.Flag{
+				&cli.BoolFlag{
+					Name:        "versioning-enabled",
+					Usage:       "Test the bucket object versioning, if the versioning is enabled",
+					Destination: &versioningEnabled,
+					Aliases:     []string{"vs"},
+				},
 			},
 		})
 	}

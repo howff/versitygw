@@ -36,12 +36,12 @@ type tmpfile struct {
 	size    int64
 }
 
-func (p *Posix) openTmpFile(dir, bucket, obj string, size int64, acct auth.Account) (*tmpfile, error) {
+func (p *Posix) openTmpFile(dir, bucket, obj string, size int64, acct auth.Account, _ bool) (*tmpfile, error) {
 	uid, gid, doChown := p.getChownIDs(acct)
 
 	// Create a temp file for upload while in progress (see link comments below).
 	var err error
-	err = backend.MkdirAll(dir, uid, gid, doChown)
+	err = backend.MkdirAll(dir, uid, gid, doChown, p.newDirPerm)
 	if err != nil {
 		return nil, fmt.Errorf("make temp dir: %w", err)
 	}
@@ -111,4 +111,8 @@ func (tmp *tmpfile) Write(b []byte) (int, error) {
 
 func (tmp *tmpfile) cleanup() {
 	tmp.f.Close()
+}
+
+func (tmp *tmpfile) File() *os.File {
+	return tmp.f
 }

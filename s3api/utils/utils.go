@@ -31,11 +31,16 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/valyala/fasthttp"
 	"github.com/versity/versitygw/s3err"
+	"github.com/versity/versitygw/s3response"
 )
 
 var (
 	bucketNameRegexp   = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]+[a-z0-9]$`)
 	bucketNameIpRegexp = regexp.MustCompile(`^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$`)
+)
+
+const (
+	upperhex = "0123456789ABCDEF"
 )
 
 func GetUserMetaData(headers *fasthttp.RequestHeader) (metadata map[string]string) {
@@ -63,7 +68,9 @@ func createHttpRequestFromCtx(ctx *fiber.Ctx, signedHdrs []string, contentLength
 		body = bytes.NewReader(req.Body())
 	}
 
-	httpReq, err := http.NewRequest(string(req.Header.Method()), string(ctx.Context().RequestURI()), body)
+	escapedURI := escapeOriginalURI(ctx)
+
+	httpReq, err := http.NewRequest(string(req.Header.Method()), escapedURI, body)
 	if err != nil {
 		return nil, errors.New("error in creating an http request")
 	}
@@ -173,7 +180,7 @@ func ParseUint(str string) (int32, error) {
 	}
 	num, err := strconv.ParseUint(str, 10, 16)
 	if err != nil {
-		return 1000, s3err.GetAPIError(s3err.ErrInvalidMaxKeys)
+		return 1000, fmt.Errorf("invalid uint: %w", err)
 	}
 	return int32(num), nil
 }
@@ -223,24 +230,17 @@ func IsBigDataAction(ctx *fiber.Ctx) bool {
 	return false
 }
 
+// expiration time window
+// https://docs.aws.amazon.com/AmazonS3/latest/userguide/RESTAuthentication.html#RESTAuthenticationTimeStamp
+const timeExpirationSec = 15 * 60
+
 func ValidateDate(date time.Time) error {
 	now := time.Now().UTC()
 	diff := date.Unix() - now.Unix()
 
-	// Checks the dates difference to be less than a minute
-	if diff > 60 {
-		return s3err.APIError{
-			Code:           "SignatureDoesNotMatch",
-			Description:    fmt.Sprintf("Signature not yet current: %s is still later than %s", date.Format(iso8601Format), now.Format(iso8601Format)),
-			HTTPStatusCode: http.StatusForbidden,
-		}
-	}
-	if diff < -60 {
-		return s3err.APIError{
-			Code:           "SignatureDoesNotMatch",
-			Description:    fmt.Sprintf("Signature expired: %s is now earlier than %s", date.Format(iso8601Format), now.Format(iso8601Format)),
-			HTTPStatusCode: http.StatusForbidden,
-		}
+	// Checks the dates difference to be within allotted window
+	if diff > timeExpirationSec || diff < -timeExpirationSec {
+		return s3err.GetAPIError(s3err.ErrRequestTimeTooSkewed)
 	}
 
 	return nil
@@ -252,4 +252,183 @@ func ParseDeleteObjects(objs []types.ObjectIdentifier) (result []string) {
 	}
 
 	return
+}
+
+func FilterObjectAttributes(attrs map[s3response.ObjectAttributes]struct{}, output s3response.GetObjectAttributesResponse) s3response.GetObjectAttributesResponse {
+	// These properties shouldn't appear in the final response body
+	output.LastModified = nil
+	output.VersionId = nil
+	output.DeleteMarker = nil
+
+	if _, ok := attrs[s3response.ObjectAttributesEtag]; !ok {
+		output.ETag = nil
+	}
+	if _, ok := attrs[s3response.ObjectAttributesObjectParts]; !ok {
+		output.ObjectParts = nil
+	}
+	if _, ok := attrs[s3response.ObjectAttributesObjectSize]; !ok {
+		output.ObjectSize = nil
+	}
+	if _, ok := attrs[s3response.ObjectAttributesStorageClass]; !ok {
+		output.StorageClass = ""
+	}
+	fmt.Printf("%+v\n", output)
+
+	return output
+}
+
+func ParseObjectAttributes(ctx *fiber.Ctx) (map[s3response.ObjectAttributes]struct{}, error) {
+	attrs := map[s3response.ObjectAttributes]struct{}{}
+	var err error
+	ctx.Request().Header.VisitAll(func(key, value []byte) {
+		if string(key) == "X-Amz-Object-Attributes" {
+			oattrs := strings.Split(string(value), ",")
+			for _, a := range oattrs {
+				attr := s3response.ObjectAttributes(a)
+				if !attr.IsValid() {
+					err = s3err.GetAPIError(s3err.ErrInvalidObjectAttributes)
+					break
+				}
+				attrs[attr] = struct{}{}
+			}
+		}
+	})
+
+	if len(attrs) == 0 {
+		return nil, s3err.GetAPIError(s3err.ErrObjectAttributesInvalidHeader)
+	}
+
+	return attrs, err
+}
+
+type objLockCfg struct {
+	RetainUntilDate time.Time
+	ObjectLockMode  types.ObjectLockMode
+	LegalHoldStatus types.ObjectLockLegalHoldStatus
+}
+
+func ParsObjectLockHdrs(ctx *fiber.Ctx) (*objLockCfg, error) {
+	legalHoldHdr := ctx.Get("X-Amz-Object-Lock-Legal-Hold")
+	objLockModeHdr := ctx.Get("X-Amz-Object-Lock-Mode")
+	objLockDate := ctx.Get("X-Amz-Object-Lock-Retain-Until-Date")
+
+	if (objLockDate != "" && objLockModeHdr == "") || (objLockDate == "" && objLockModeHdr != "") {
+		return nil, s3err.GetAPIError(s3err.ErrObjectLockInvalidHeaders)
+	}
+
+	var retainUntilDate time.Time
+	if objLockDate != "" {
+		rDate, err := time.Parse(time.RFC3339, objLockDate)
+		if err != nil {
+			return nil, s3err.GetAPIError(s3err.ErrInvalidRequest)
+		}
+		if rDate.Before(time.Now()) {
+			return nil, s3err.GetAPIError(s3err.ErrPastObjectLockRetainDate)
+		}
+		retainUntilDate = rDate
+	}
+
+	objLockMode := types.ObjectLockMode(objLockModeHdr)
+
+	if objLockMode != "" &&
+		objLockMode != types.ObjectLockModeCompliance &&
+		objLockMode != types.ObjectLockModeGovernance {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidRequest)
+	}
+
+	legalHold := types.ObjectLockLegalHoldStatus(legalHoldHdr)
+
+	if legalHold != "" && legalHold != types.ObjectLockLegalHoldStatusOff && legalHold != types.ObjectLockLegalHoldStatusOn {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidRequest)
+	}
+
+	return &objLockCfg{
+		RetainUntilDate: retainUntilDate,
+		ObjectLockMode:  objLockMode,
+		LegalHoldStatus: legalHold,
+	}, nil
+}
+
+func IsValidOwnership(val types.ObjectOwnership) bool {
+	switch val {
+	case types.ObjectOwnershipBucketOwnerEnforced:
+		return true
+	case types.ObjectOwnershipBucketOwnerPreferred:
+		return true
+	case types.ObjectOwnershipObjectWriter:
+		return true
+	default:
+		return false
+	}
+}
+
+func escapeOriginalURI(ctx *fiber.Ctx) string {
+	path := ctx.Path()
+
+	// Escape the URI original path
+	escapedURI := escapePath(path)
+
+	// Add the URI query params
+	query := string(ctx.Request().URI().QueryArgs().QueryString())
+	if query != "" {
+		escapedURI = escapedURI + "?" + query
+	}
+
+	return escapedURI
+}
+
+// Escapes the path string
+// Most of the parts copied from std url
+func escapePath(s string) string {
+	hexCount := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if shouldEscape(c) {
+			hexCount++
+		}
+	}
+
+	if hexCount == 0 {
+		return s
+	}
+
+	var buf [64]byte
+	var t []byte
+
+	required := len(s) + 2*hexCount
+	if required <= len(buf) {
+		t = buf[:required]
+	} else {
+		t = make([]byte, required)
+	}
+
+	j := 0
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case shouldEscape(c):
+			t[j] = '%'
+			t[j+1] = upperhex[c>>4]
+			t[j+2] = upperhex[c&15]
+			j += 3
+		default:
+			t[j] = s[i]
+			j++
+		}
+	}
+
+	return string(t)
+}
+
+// Checks if the character needs to be escaped
+func shouldEscape(c byte) bool {
+	if 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' {
+		return false
+	}
+
+	switch c {
+	case '-', '_', '.', '~', '/':
+		return false
+	}
+
+	return true
 }

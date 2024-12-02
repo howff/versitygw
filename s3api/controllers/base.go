@@ -22,6 +22,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +32,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/backend"
+	"github.com/versity/versitygw/metrics"
 	"github.com/versity/versitygw/s3api/utils"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3event"
@@ -43,30 +45,61 @@ type S3ApiController struct {
 	iam      auth.IAMService
 	logger   s3log.AuditLogger
 	evSender s3event.S3EventSender
+	mm       *metrics.Manager
 	debug    bool
+	readonly bool
 }
 
 const (
-	iso8601Format = "20060102T150405Z"
+	iso8601Format             = "20060102T150405Z"
+	iso8601TimeFormatExtended = "Mon Jan _2 15:04:05 2006"
+	defaultContentType        = "binary/octet-stream"
 )
 
-func New(be backend.Backend, iam auth.IAMService, logger s3log.AuditLogger, evs s3event.S3EventSender, debug bool) S3ApiController {
+func New(be backend.Backend, iam auth.IAMService, logger s3log.AuditLogger, evs s3event.S3EventSender, mm *metrics.Manager, debug bool, readonly bool) S3ApiController {
 	return S3ApiController{
 		be:       be,
 		iam:      iam,
 		logger:   logger,
 		evSender: evs,
 		debug:    debug,
+		readonly: readonly,
+		mm:       mm,
 	}
 }
 
 func (c S3ApiController) ListBuckets(ctx *fiber.Ctx) error {
+	cToken := ctx.Query("continuation-token")
+	prefix := ctx.Query("prefix")
+	maxBucketsStr := ctx.Query("max-buckets")
 	acct := ctx.Locals("account").(auth.Account)
-	res, err := c.be.ListBuckets(ctx.Context(), acct.Access, acct.Role == "admin")
+
+	maxBuckets, err := utils.ParseUint(maxBucketsStr)
+	if err != nil || maxBuckets > 10000 {
+		if c.debug {
+			log.Printf("error parsing max-buckets %q: %v\n", maxBucketsStr, err)
+		}
+		return SendXMLResponse(ctx, nil, s3err.GetAPIError(s3err.ErrInvalidMaxBuckets),
+			&MetaOpts{
+				Logger:     c.logger,
+				MetricsMng: c.mm,
+				Action:     metrics.ActionListAllMyBuckets,
+			})
+	}
+
+	res, err := c.be.ListBuckets(ctx.Context(),
+		s3response.ListBucketsInput{
+			Owner:             acct.Access,
+			IsAdmin:           acct.Role == auth.RoleAdmin,
+			MaxBuckets:        maxBuckets,
+			ContinuationToken: cToken,
+			Prefix:            prefix,
+		})
 	return SendXMLResponse(ctx, res, err,
 		&MetaOpts{
-			Logger: c.logger,
-			Action: "ListBucket",
+			Logger:     c.logger,
+			MetricsMng: c.mm,
+			Action:     metrics.ActionListAllMyBuckets,
 		})
 }
 
@@ -75,7 +108,6 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 	key := ctx.Params("key")
 	keyEnd := ctx.Params("*1")
 	uploadId := ctx.Query("uploadId")
-	maxParts := int32(ctx.QueryInt("max-parts", -1))
 	partNumberMarker := ctx.Query("part-number-marker")
 	acceptRange := ctx.Get("Range")
 	acct := ctx.Locals("account").(auth.Account)
@@ -85,9 +117,14 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 	if keyEnd != "" {
 		key = strings.Join([]string{key, keyEnd}, "/")
 	}
+	path := ctx.Path()
+	if path[len(path)-1:] == "/" && key[len(key)-1:] != "/" {
+		key = key + "/"
+	}
 
 	if ctx.Request().URI().QueryArgs().Has("tagging") {
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -100,7 +137,8 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetObjectTagging",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetObjectTagging,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -110,7 +148,8 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetObjectTagging",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetObjectTagging,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -126,13 +165,15 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, res, nil,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "GetObjectTagging",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionGetObjectTagging,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	if ctx.Request().URI().QueryArgs().Has("retention") {
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -145,7 +186,8 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetObjectRetention",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetObjectRetention,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -155,7 +197,8 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, data, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetObjectRetention",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetObjectRetention,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -164,13 +207,15 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, retention, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "GetObjectRetention",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionGetObjectRetention,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	if ctx.Request().URI().QueryArgs().Has("legal-hold") {
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -183,7 +228,8 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetObjectLegalHold",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetObjectLegalHold,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -192,21 +238,13 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, auth.ParseObjectLegalHoldOutput(data), err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "GetObjectLegalHold",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionGetObjectLegalHold,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	if uploadId != "" {
-		if maxParts < 0 && ctx.Request().URI().QueryArgs().Has("max-parts") {
-			return SendResponse(ctx,
-				s3err.GetAPIError(s3err.ErrInvalidMaxParts),
-				&MetaOpts{
-					Logger:      c.logger,
-					Action:      "ListParts",
-					BucketOwner: parsedAcl.Owner,
-				})
-		}
 		if partNumberMarker != "" {
 			n, err := strconv.Atoi(partNumberMarker)
 			if err != nil || n < 0 {
@@ -218,13 +256,31 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 					s3err.GetAPIError(s3err.ErrInvalidPartNumberMarker),
 					&MetaOpts{
 						Logger:      c.logger,
-						Action:      "ListParts",
+						MetricsMng:  c.mm,
+						Action:      metrics.ActionListParts,
 						BucketOwner: parsedAcl.Owner,
 					})
 			}
 		}
+		mxParts := ctx.Query("max-parts")
+		maxParts, err := utils.ParseUint(mxParts)
+		if err != nil {
+			if c.debug {
+				log.Printf("error parsing max parts %q: %v",
+					mxParts, err)
+			}
+			return SendResponse(ctx,
+				s3err.GetAPIError(s3err.ErrInvalidMaxParts),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionListParts,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
 
-		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+		err = auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -237,13 +293,10 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "ListParts",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionListParts,
 					BucketOwner: parsedAcl.Owner,
 				})
-		}
-		var mxParts *int32
-		if ctx.Request().URI().QueryArgs().Has("max-parts") {
-			mxParts = &maxParts
 		}
 
 		res, err := c.be.ListParts(ctx.Context(), &s3.ListPartsInput{
@@ -251,18 +304,20 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 			Key:              &key,
 			UploadId:         &uploadId,
 			PartNumberMarker: &partNumberMarker,
-			MaxParts:         mxParts,
+			MaxParts:         &maxParts,
 		})
 		return SendXMLResponse(ctx, res, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "ListParts",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionListParts,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	if ctx.Request().URI().QueryArgs().Has("acl") {
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionReadAcp,
 			IsRoot:        isRoot,
@@ -275,7 +330,8 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetObjectAcl",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetObjectAcl,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -286,13 +342,15 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, res, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "GetObjectAcl",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionGetObjectAcl,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
-	if attrs := ctx.Get("X-Amz-Object-Attributes"); attrs != "" {
+	if ctx.Request().URI().QueryArgs().Has("attributes") {
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -305,42 +363,124 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetObjectAttributes",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetObjectAttributes,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
-		var oattrs []types.ObjectAttributes
-		for _, a := range strings.Split(attrs, ",") {
-			oattrs = append(oattrs, types.ObjectAttributes(a))
+		maxParts := ctx.Get("X-Amz-Max-Parts")
+		partNumberMarker := ctx.Get("X-Amz-Part-Number-Marker")
+		maxPartsParsed, err := utils.ParseUint(maxParts)
+		if err != nil {
+			return SendXMLResponse(ctx, nil, s3err.GetAPIError(s3err.ErrInvalidMaxParts),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetObjectAttributes,
+					BucketOwner: parsedAcl.Owner,
+				})
 		}
+		attrs, err := utils.ParseObjectAttributes(ctx)
+		if err != nil {
+			if c.debug {
+				log.Printf("error parsing object attributes: %v", err)
+			}
+			return SendXMLResponse(ctx, nil, err,
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetObjectAttributes,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
 		res, err := c.be.GetObjectAttributes(ctx.Context(),
 			&s3.GetObjectAttributesInput{
 				Bucket:           &bucket,
 				Key:              &key,
-				ObjectAttributes: oattrs,
+				PartNumberMarker: &partNumberMarker,
+				MaxParts:         &maxPartsParsed,
+				VersionId:        &versionId,
 			})
-		return SendXMLResponse(ctx, res, err,
+		if err != nil {
+			hdrs := []utils.CustomHeader{}
+
+			if res.DeleteMarker != nil {
+				hdrs = append(hdrs, utils.CustomHeader{
+					Key:   "x-amz-delete-marker",
+					Value: "true",
+				})
+			}
+			if getstring(res.VersionId) != "" {
+				hdrs = append(hdrs, utils.CustomHeader{
+					Key:   "x-amz-version-id",
+					Value: getstring(res.VersionId),
+				})
+			}
+
+			utils.SetResponseHeaders(ctx, hdrs)
+			return SendXMLResponse(ctx, nil, err,
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetObjectAttributes,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
+		hdrs := []utils.CustomHeader{}
+
+		if getstring(res.VersionId) != "" {
+			hdrs = append(hdrs, utils.CustomHeader{
+				Key:   "x-amz-version-id",
+				Value: getstring(res.VersionId),
+			})
+		}
+		if res.DeleteMarker != nil && *res.DeleteMarker {
+			hdrs = append(hdrs, utils.CustomHeader{
+				Key:   "x-amz-delete-marker",
+				Value: "true",
+			})
+		}
+		if res.LastModified != nil {
+			hdrs = append(hdrs, utils.CustomHeader{
+				Key:   "Last-Modified",
+				Value: res.LastModified.UTC().Format(iso8601TimeFormatExtended),
+			})
+		}
+
+		utils.SetResponseHeaders(ctx, hdrs)
+
+		return SendXMLResponse(ctx, utils.FilterObjectAttributes(attrs, res), nil,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "GetObjectAttributes",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionGetObjectAttributes,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
+	action := auth.GetObjectAction
+	if versionId != "" {
+		action = auth.GetObjectVersionAction
+	}
+
 	err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+		Readonly:      c.readonly,
 		Acl:           parsedAcl,
 		AclPermission: types.PermissionRead,
 		IsRoot:        isRoot,
 		Acc:           acct,
 		Bucket:        bucket,
 		Object:        key,
-		Action:        auth.GetObjectAction,
+		Action:        action,
 	})
 	if err != nil {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "GetObject",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionGetObject,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
@@ -351,79 +491,115 @@ func (c S3ApiController) GetActions(ctx *fiber.Ctx) error {
 		Key:       &key,
 		Range:     &acceptRange,
 		VersionId: &versionId,
-	}, ctx.Response().BodyWriter())
+	})
 	if err != nil {
+		if res != nil {
+			utils.SetResponseHeaders(ctx, []utils.CustomHeader{
+				{
+					Key:   "x-amz-delete-marker",
+					Value: "true",
+				},
+				{
+					Key:   "Last-Modified",
+					Value: res.LastModified.Format(timefmt),
+				},
+			})
+		}
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "GetObject",
-				BucketOwner: parsedAcl.Owner,
-			})
-	}
-	if res == nil {
-		return SendResponse(ctx, fmt.Errorf("get object nil response"),
-			&MetaOpts{
-				Logger:      c.logger,
-				Action:      "GetObject",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionHeadObject,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
-	utils.SetMetaHeaders(ctx, res.Metadata)
-	var lastmod string
-	if res.LastModified != nil {
-		lastmod = res.LastModified.Format(timefmt)
+	contentType := getstring(res.ContentType)
+	if contentType == "" {
+		contentType = defaultContentType
+	}
+	acceptRanges := getstring(res.AcceptRanges)
+	if acceptRanges == "" {
+		acceptRanges = "bytes"
 	}
 
-	utils.SetResponseHeaders(ctx, []utils.CustomHeader{
-		{
-			Key:   "Content-Length",
-			Value: fmt.Sprint(getint64(res.ContentLength)),
-		},
+	hdrs := []utils.CustomHeader{
 		{
 			Key:   "Content-Type",
-			Value: getstring(res.ContentType),
-		},
-		{
-			Key:   "Content-Encoding",
-			Value: getstring(res.ContentEncoding),
+			Value: contentType,
 		},
 		{
 			Key:   "ETag",
 			Value: getstring(res.ETag),
 		},
 		{
-			Key:   "Last-Modified",
-			Value: lastmod,
+			Key:   "accept-ranges",
+			Value: acceptRanges,
 		},
-		{
-			Key:   "x-amz-storage-class",
-			Value: string(res.StorageClass),
-		},
-		{
+	}
+
+	if getstring(res.ContentRange) != "" {
+		hdrs = append(hdrs, utils.CustomHeader{
 			Key:   "Content-Range",
 			Value: getstring(res.ContentRange),
-		},
-		{
-			Key:   "accept-ranges",
-			Value: getstring(res.AcceptRanges),
-		},
-	})
-
+		})
+	}
+	if res.LastModified != nil {
+		hdrs = append(hdrs, utils.CustomHeader{
+			Key:   "Last-Modified",
+			Value: res.LastModified.Format(timefmt),
+		})
+	}
+	if getstring(res.ContentEncoding) != "" {
+		hdrs = append(hdrs, utils.CustomHeader{
+			Key:   "Content-Encoding",
+			Value: getstring(res.ContentEncoding),
+		})
+	}
 	if res.TagCount != nil {
+		hdrs = append(hdrs, utils.CustomHeader{
+			Key:   "x-amz-tagging-count",
+			Value: fmt.Sprint(*res.TagCount),
+		})
+	}
+	if res.StorageClass != "" {
+		hdrs = append(hdrs, utils.CustomHeader{
+			Key:   "x-amz-storage-class",
+			Value: string(res.StorageClass),
+		})
+	}
+
+	// Set x-amz-meta-... headers
+	utils.SetMetaHeaders(ctx, res.Metadata)
+	// Set other response headers
+	utils.SetResponseHeaders(ctx, hdrs)
+	// Set version id header
+	if getstring(res.VersionId) != "" {
 		utils.SetResponseHeaders(ctx, []utils.CustomHeader{
 			{
-				Key:   "x-amz-tagging-count",
-				Value: fmt.Sprint(*res.TagCount),
+				Key:   "x-amz-version-id",
+				Value: getstring(res.VersionId),
 			},
 		})
 	}
 
-	return SendResponse(ctx, err,
+	status := http.StatusOK
+	if acceptRange != "" {
+		status = http.StatusPartialContent
+	}
+
+	if res.Body != nil {
+		ctx.Response().SetBodyStream(res.Body, int(getint64(res.ContentLength)))
+	}
+
+	return SendResponse(ctx, nil,
 		&MetaOpts{
-			Logger:      c.logger,
-			Action:      "GetObject",
-			BucketOwner: parsedAcl.Owner,
+			Logger:        c.logger,
+			MetricsMng:    c.mm,
+			Action:        metrics.ActionGetObject,
+			ContentLength: getint64(res.ContentLength),
+			BucketOwner:   parsedAcl.Owner,
+			Status:        status,
 		})
 }
 
@@ -459,6 +635,7 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 
 	if ctx.Request().URI().QueryArgs().Has("tagging") {
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -470,7 +647,8 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetBucketTagging",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetBucketTagging,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -480,7 +658,8 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetBucketTagging",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetBucketTagging,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -496,13 +675,52 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, resp, nil,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "GetBucketTagging",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionGetBucketTagging,
+				BucketOwner: parsedAcl.Owner,
+			})
+	}
+
+	if ctx.Request().URI().QueryArgs().Has("ownershipControls") {
+		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
+			Acl:           parsedAcl,
+			AclPermission: types.PermissionRead,
+			IsRoot:        isRoot,
+			Acc:           acct,
+			Bucket:        bucket,
+			Action:        auth.GetBucketOwnershipControlsAction,
+		})
+		if err != nil {
+			return SendXMLResponse(ctx, nil, err,
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetBucketOwnershipControls,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
+		data, err := c.be.GetBucketOwnershipControls(ctx.Context(), bucket)
+		return SendXMLResponse(ctx,
+			s3response.OwnershipControls{
+				Rules: []types.OwnershipControlsRule{
+					{
+						ObjectOwnership: data,
+					},
+				},
+			}, err,
+			&MetaOpts{
+				Logger:      c.logger,
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionGetBucketOwnershipControls,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	if ctx.Request().URI().QueryArgs().Has("versioning") {
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -514,7 +732,8 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetBucketVersioning",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetBucketVersioning,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -523,7 +742,8 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetBucketVersioning",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetBucketVersioning,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -532,13 +752,15 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, data, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "GetBucketVersioning",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionGetBucketVersioning,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	if ctx.Request().URI().QueryArgs().Has("policy") {
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -550,7 +772,8 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetBucketPolicy",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetBucketPolicy,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -559,13 +782,15 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, data, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "GetBucketPolicy",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionGetBucketPolicy,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	if ctx.Request().URI().QueryArgs().Has("versions") {
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -577,7 +802,8 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "ListObjectVersions",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionListObjectVersions,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -588,10 +814,11 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 				log.Printf("error parsing max keys %q: %v",
 					maxkeysStr, err)
 			}
-			return SendXMLResponse(ctx, nil, err,
+			return SendXMLResponse(ctx, nil, s3err.GetAPIError(s3err.ErrInvalidMaxKeys),
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "ListObjectVersions",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionListObjectVersions,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -608,13 +835,15 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, data, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "ListObjectVersions",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionListObjectVersions,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	if ctx.Request().URI().QueryArgs().Has("object-lock") {
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -626,7 +855,8 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetObjectLockConfiguration",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetObjectLockConfiguration,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -636,7 +866,8 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetObjectLockConfiguration",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetObjectLockConfiguration,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -645,13 +876,15 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, resp, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "GetObjectLockConfiguration",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionGetObjectLockConfiguration,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	if ctx.Request().URI().QueryArgs().Has("acl") {
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionReadAcp,
 			IsRoot:        isRoot,
@@ -663,7 +896,8 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "GetBucketAcl",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionGetBucketAcl,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -673,7 +907,8 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 		if err != nil {
 			return SendResponse(ctx, err,
 				&MetaOpts{
-					Logger: c.logger,
+					Logger:     c.logger,
+					MetricsMng: c.mm,
 				})
 		}
 
@@ -681,13 +916,15 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, res, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "GetBucketAcl",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionGetBucketAcl,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	if ctx.Request().URI().QueryArgs().Has("uploads") {
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -699,7 +936,8 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "ListMultipartUploads",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionListMultipartUploads,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -709,11 +947,13 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 				log.Printf("error parsing max uploads %q: %v",
 					maxUploadsStr, err)
 			}
-			return SendXMLResponse(ctx, nil, err, &MetaOpts{
-				Logger:      c.logger,
-				Action:      "ListMultipartUploads",
-				BucketOwner: parsedAcl.Owner,
-			})
+			return SendXMLResponse(ctx, nil, s3err.GetAPIError(s3err.ErrInvalidMaxUploads),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionListMultipartUploads,
+					BucketOwner: parsedAcl.Owner,
+				})
 		}
 		res, err := c.be.ListMultipartUploads(ctx.Context(),
 			&s3.ListMultipartUploadsInput{
@@ -727,13 +967,15 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, res, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "ListMultipartUploads",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionListMultipartUploads,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	if ctx.QueryInt("list-type") == 2 {
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -745,7 +987,8 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "ListObjectsV2",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionListObjectsV2,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -755,10 +998,11 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 				log.Printf("error parsing max keys %q: %v",
 					maxkeysStr, err)
 			}
-			return SendXMLResponse(ctx, nil, err,
+			return SendXMLResponse(ctx, nil, s3err.GetAPIError(s3err.ErrInvalidMaxKeys),
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "ListObjectsV2",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionListObjectsV2,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -774,12 +1018,14 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, res, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "ListObjectsV2",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionListObjectsV2,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+		Readonly:      c.readonly,
 		Acl:           parsedAcl,
 		AclPermission: types.PermissionRead,
 		IsRoot:        isRoot,
@@ -791,7 +1037,8 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, nil, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "ListObjects",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionListObjects,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
@@ -802,10 +1049,11 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 			log.Printf("error parsing max keys %q: %v",
 				maxkeysStr, err)
 		}
-		return SendXMLResponse(ctx, nil, err,
+		return SendXMLResponse(ctx, nil, s3err.GetAPIError(s3err.ErrInvalidMaxKeys),
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "ListObjects",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionListObjects,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
@@ -818,13 +1066,11 @@ func (c S3ApiController) ListActions(ctx *fiber.Ctx) error {
 			Delimiter: &delimiter,
 			MaxKeys:   &maxkeys,
 		})
-	return SendXMLResponse(ctx, struct {
-		*s3.ListObjectsOutput
-		XMLName struct{} `xml:"http://s3.amazonaws.com/doc/2006-03-01/ ListBucketResult"`
-	}{ListObjectsOutput: res}, err,
+	return SendXMLResponse(ctx, res, err,
 		&MetaOpts{
 			Logger:      c.logger,
-			Action:      "ListObjects",
+			MetricsMng:  c.mm,
+			Action:      metrics.ActionListObjects,
 			BucketOwner: parsedAcl.Owner,
 		})
 }
@@ -837,8 +1083,11 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 	grantReadACP := ctx.Get("X-Amz-Grant-Read-Acp")
 	granWrite := ctx.Get("X-Amz-Grant-Write")
 	grantWriteACP := ctx.Get("X-Amz-Grant-Write-Acp")
-	mfa := ctx.Get("X-Amz-Mfa")
-	contentMD5 := ctx.Get("Content-MD5")
+	objectOwnership := types.ObjectOwnership(
+		ctx.Get("X-Amz-Object-Ownership", string(types.ObjectOwnershipBucketOwnerEnforced)),
+	)
+	// mfa := ctx.Get("X-Amz-Mfa")
+	// contentMD5 := ctx.Get("Content-MD5")
 	acct := ctx.Locals("account").(auth.Account)
 	isRoot := ctx.Locals("isRoot").(bool)
 
@@ -854,7 +1103,8 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidRequest),
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutBucketTagging",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketTagging,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -866,7 +1116,8 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 				return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidTag),
 					&MetaOpts{
 						Logger:      c.logger,
-						Action:      "PutBucketTagging",
+						MetricsMng:  c.mm,
+						Action:      metrics.ActionPutBucketTagging,
 						BucketOwner: parsedAcl.Owner,
 					})
 			}
@@ -874,6 +1125,7 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 		}
 
 		err = auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionWrite,
 			IsRoot:        isRoot,
@@ -885,7 +1137,8 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutBucketTagging",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketTagging,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -894,7 +1147,60 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "PutBucketTagging",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionPutBucketTagging,
+				BucketOwner: parsedAcl.Owner,
+				Status:      http.StatusNoContent,
+			})
+	}
+
+	if ctx.Request().URI().QueryArgs().Has("ownershipControls") {
+		parsedAcl := ctx.Locals("parsedAcl").(auth.ACL)
+		var ownershipControls s3response.OwnershipControls
+		if err := xml.Unmarshal(ctx.Body(), &ownershipControls); err != nil {
+			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrMalformedXML),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketOwnershipControls,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
+		if len(ownershipControls.Rules) != 1 || !utils.IsValidOwnership(ownershipControls.Rules[0].ObjectOwnership) {
+			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrMalformedXML),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketOwnershipControls,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
+		if err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
+			Acl:           parsedAcl,
+			AclPermission: types.PermissionWrite,
+			IsRoot:        isRoot,
+			Acc:           acct,
+			Bucket:        bucket,
+			Action:        auth.PutBucketOwnershipControlsAction,
+		}); err != nil {
+			return SendResponse(ctx, err,
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketOwnershipControls,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
+		err := c.be.PutBucketOwnershipControls(ctx.Context(), bucket, ownershipControls.Rules[0].ObjectOwnership)
+		return SendResponse(ctx, err,
+			&MetaOpts{
+				Logger:      c.logger,
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionPutBucketOwnershipControls,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
@@ -902,6 +1208,7 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 	if ctx.Request().URI().QueryArgs().Has("versioning") {
 		parsedAcl := ctx.Locals("parsedAcl").(auth.ACL)
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionWrite,
 			IsRoot:        isRoot,
@@ -913,7 +1220,8 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutBucketVersioning",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketVersioning,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -928,22 +1236,32 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidRequest),
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutBucketVersioning",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketVersioning,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
 
-		err = c.be.PutBucketVersioning(ctx.Context(),
-			&s3.PutBucketVersioningInput{
-				Bucket:                  &bucket,
-				MFA:                     &mfa,
-				VersioningConfiguration: &versioningConf,
-				ContentMD5:              &contentMD5,
-			})
+		if versioningConf.Status != types.BucketVersioningStatusEnabled &&
+			versioningConf.Status != types.BucketVersioningStatusSuspended {
+			if c.debug {
+				log.Printf("invalid versioning configuration status: %v\n", versioningConf.Status)
+			}
+			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrMalformedXML),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketVersioning,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
+		err = c.be.PutBucketVersioning(ctx.Context(), bucket, versioningConf.Status)
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "PutBucketVersioning",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionPutBucketVersioning,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
@@ -952,6 +1270,7 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 		parsedAcl := ctx.Locals("parsedAcl").(auth.ACL)
 
 		if err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionWrite,
 			IsRoot:        isRoot,
@@ -962,7 +1281,8 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutObjectLockConfiguration",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutObjectLockConfiguration,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -972,7 +1292,8 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutObjectLockConfiguration",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutObjectLockConfiguration,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -981,7 +1302,8 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "PutObjectLockConfiguration",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionPutObjectLockConfiguration,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
@@ -989,6 +1311,7 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 	if ctx.Request().URI().QueryArgs().Has("policy") {
 		parsedAcl := ctx.Locals("parsedAcl").(auth.ACL)
 		err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionWrite,
 			IsRoot:        isRoot,
@@ -1000,7 +1323,8 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutBucketPolicy",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketPolicy,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -1010,7 +1334,8 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutBucketPolicy",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketPolicy,
 					BucketOwner: parsedAcl.Owner,
 				},
 			)
@@ -1020,7 +1345,8 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "PutBucketPolicy",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionPutBucketPolicy,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
@@ -1028,12 +1354,35 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 	grants := grantFullControl + grantRead + grantReadACP + granWrite + grantWriteACP
 
 	if ctx.Request().URI().QueryArgs().Has("acl") {
-		var input *s3.PutBucketAclInput
-		var accessControlPolicy auth.AccessControlPolicy
-
 		parsedAcl := ctx.Locals("parsedAcl").(auth.ACL)
-		err := auth.VerifyAccess(ctx.Context(), c.be,
+		var input *auth.PutBucketAclInput
+
+		ownership, err := c.be.GetBucketOwnershipControls(ctx.Context(), bucket)
+		if err != nil && !errors.Is(err, s3err.GetAPIError(s3err.ErrOwnershipControlsNotFound)) {
+			return SendResponse(ctx, err,
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketAcl,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+		if ownership == types.ObjectOwnershipBucketOwnerEnforced {
+			if c.debug {
+				log.Println("bucket acls are disabled")
+			}
+			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrAclNotSupported),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketAcl,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
+		err = auth.VerifyAccess(ctx.Context(), c.be,
 			auth.AccessOptions{
+				Readonly:      c.readonly,
 				Acl:           parsedAcl,
 				AclPermission: types.PermissionWriteAcp,
 				IsRoot:        isRoot,
@@ -1045,49 +1394,77 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutBucketAcl",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketAcl,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
 
-		err = xml.Unmarshal(ctx.Body(), &accessControlPolicy)
-		if err != nil {
-			if c.debug {
-				log.Printf("error unmarshalling access control policy: %v", err)
+		if len(ctx.Body()) > 0 {
+			var accessControlPolicy auth.AccessControlPolicy
+			err := xml.Unmarshal(ctx.Body(), &accessControlPolicy)
+			if err != nil {
+				if c.debug {
+					log.Printf("error unmarshalling access control policy: %v", err)
+				}
+				return SendResponse(ctx, s3err.GetAPIError(s3err.ErrMalformedACL),
+					&MetaOpts{
+						Logger:      c.logger,
+						Action:      metrics.ActionPutBucketAcl,
+						BucketOwner: parsedAcl.Owner,
+					})
 			}
-			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidRequest),
-				&MetaOpts{
-					Logger:      c.logger,
-					Action:      "PutBucketAcl",
-					BucketOwner: parsedAcl.Owner,
-				})
-		}
 
-		if len(accessControlPolicy.AccessControlList.Grants) > 0 {
+			if accessControlPolicy.Owner == nil ||
+				accessControlPolicy.Owner.ID == nil ||
+				*accessControlPolicy.Owner.ID == "" {
+				if c.debug {
+					log.Println("empty access control policy owner")
+				}
+				return SendResponse(ctx, s3err.GetAPIError(s3err.ErrMalformedACL),
+					&MetaOpts{
+						Logger:      c.logger,
+						Action:      metrics.ActionPutBucketAcl,
+						BucketOwner: parsedAcl.Owner,
+					})
+			}
+
+			if *accessControlPolicy.Owner.ID != parsedAcl.Owner {
+				if c.debug {
+					log.Printf("invalid access control policy owner id: %v, expected %v", *accessControlPolicy.Owner.ID, parsedAcl.Owner)
+				}
+				return SendResponse(ctx, s3err.APIError{
+					Code:           "InvalidArgument",
+					Description:    "Invalid id",
+					HTTPStatusCode: http.StatusBadRequest,
+				},
+					&MetaOpts{
+						Logger:      c.logger,
+						Action:      metrics.ActionPutBucketAcl,
+						BucketOwner: parsedAcl.Owner,
+					})
+			}
+
 			if grants+acl != "" {
 				if c.debug {
 					log.Printf("invalid request: %q (grants) %q (acl)",
 						grants, acl)
 				}
 				return SendResponse(ctx,
-					s3err.GetAPIError(s3err.ErrInvalidRequest),
+					s3err.GetAPIError(s3err.ErrUnexpectedContent),
 					&MetaOpts{
 						Logger:      c.logger,
-						Action:      "PutBucketAcl",
+						MetricsMng:  c.mm,
+						Action:      metrics.ActionPutBucketAcl,
 						BucketOwner: parsedAcl.Owner,
 					})
 			}
 
-			input = &s3.PutBucketAclInput{
-				Bucket: &bucket,
-				ACL:    "",
-				AccessControlPolicy: &types.AccessControlPolicy{
-					Owner:  &accessControlPolicy.Owner,
-					Grants: accessControlPolicy.AccessControlList.Grants,
-				},
+			input = &auth.PutBucketAclInput{
+				Bucket:              &bucket,
+				AccessControlPolicy: &accessControlPolicy,
 			}
-		}
-		if acl != "" {
+		} else if acl != "" {
 			if acl != "private" && acl != "public-read" && acl != "public-read-write" {
 				if c.debug {
 					log.Printf("invalid acl: %q", acl)
@@ -1096,53 +1473,60 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 					s3err.GetAPIError(s3err.ErrInvalidRequest),
 					&MetaOpts{
 						Logger:      c.logger,
-						Action:      "PutBucketAcl",
+						MetricsMng:  c.mm,
+						Action:      metrics.ActionPutBucketAcl,
 						BucketOwner: parsedAcl.Owner,
 					})
 			}
-			if len(accessControlPolicy.AccessControlList.Grants) > 0 || grants != "" {
+			if grants != "" {
 				if c.debug {
 					log.Printf("invalid request: %q (grants) %q (acl)",
 						grants, acl)
 				}
 				return SendResponse(ctx,
-					s3err.GetAPIError(s3err.ErrInvalidRequest),
+					s3err.GetAPIError(s3err.ErrBothCannedAndHeaderGrants),
 					&MetaOpts{
 						Logger:      c.logger,
-						Action:      "PutBucketAcl",
+						MetricsMng:  c.mm,
+						Action:      metrics.ActionPutBucketAcl,
 						BucketOwner: parsedAcl.Owner,
 					})
 			}
 
-			input = &s3.PutBucketAclInput{
+			input = &auth.PutBucketAclInput{
 				Bucket: &bucket,
 				ACL:    types.BucketCannedACL(acl),
-				AccessControlPolicy: &types.AccessControlPolicy{
-					Owner: &accessControlPolicy.Owner,
-				},
 			}
-		}
-		if grants != "" {
-			input = &s3.PutBucketAclInput{
+		} else if grants != "" {
+			input = &auth.PutBucketAclInput{
 				Bucket:           &bucket,
 				GrantFullControl: &grantFullControl,
 				GrantRead:        &grantRead,
 				GrantReadACP:     &grantReadACP,
 				GrantWrite:       &granWrite,
 				GrantWriteACP:    &grantWriteACP,
-				AccessControlPolicy: &types.AccessControlPolicy{
-					Owner: &accessControlPolicy.Owner,
-				},
-				ACL: "",
 			}
+		} else {
+			if c.debug {
+				log.Println("none of the bucket acl options has been specified: canned, req headers, req body")
+			}
+			return SendResponse(ctx,
+				s3err.GetAPIError(s3err.ErrMissingSecurityHeader),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketAcl,
+					BucketOwner: parsedAcl.Owner,
+				})
 		}
 
-		updAcl, err := auth.UpdateACL(input, parsedAcl, c.iam)
+		updAcl, err := auth.UpdateACL(input, parsedAcl, c.iam, acct.Role == auth.RoleAdmin)
 		if err != nil {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutBucketAcl",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutBucketAcl,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -1151,7 +1535,8 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "PutBucketAcl",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionPutBucketAcl,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
@@ -1159,8 +1544,38 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 	if ok := utils.IsValidBucketName(bucket); !ok {
 		return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidBucketName),
 			&MetaOpts{
-				Logger: c.logger,
-				Action: "CreateBucket",
+				Logger:     c.logger,
+				MetricsMng: c.mm,
+				Action:     metrics.ActionCreateBucket,
+			})
+	}
+	if ok := utils.IsValidOwnership(objectOwnership); !ok {
+		if c.debug {
+			log.Printf("invalid bucket object ownership: %v", objectOwnership)
+		}
+		return SendResponse(ctx, s3err.APIError{
+			Code:           "InvalidArgument",
+			Description:    fmt.Sprintf("Invalid x-amz-object-ownership header: %v", objectOwnership),
+			HTTPStatusCode: http.StatusBadRequest,
+		},
+			&MetaOpts{
+				Logger:      c.logger,
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionCreateBucket,
+				BucketOwner: acct.Access,
+			})
+	}
+
+	if acl+grants != "" && objectOwnership == types.ObjectOwnershipBucketOwnerEnforced {
+		if c.debug {
+			log.Printf("bucket acls are disabled for %v object ownership", objectOwnership)
+		}
+		return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidBucketAclWithObjectOwnership),
+			&MetaOpts{
+				Logger:      c.logger,
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionCreateBucket,
+				BucketOwner: acct.Access,
 			})
 	}
 
@@ -1168,10 +1583,11 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 		if c.debug {
 			log.Printf("invalid request: %q (grants) %q (acl)", grants, acl)
 		}
-		return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidRequest),
+		return SendResponse(ctx, s3err.GetAPIError(s3err.ErrBothCannedAndHeaderGrants),
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "PutBucketAcl",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionCreateBucket,
 				BucketOwner: acct.Access,
 			})
 	}
@@ -1180,34 +1596,42 @@ func (c S3ApiController) PutBucketActions(ctx *fiber.Ctx) error {
 		Owner: acct.Access,
 	}
 
-	updAcl, err := auth.UpdateACL(&s3.PutBucketAclInput{
+	updAcl, err := auth.UpdateACL(&auth.PutBucketAclInput{
 		GrantFullControl: &grantFullControl,
 		GrantRead:        &grantRead,
 		GrantReadACP:     &grantReadACP,
 		GrantWrite:       &granWrite,
 		GrantWriteACP:    &grantWriteACP,
-		AccessControlPolicy: &types.AccessControlPolicy{Owner: &types.Owner{
-			ID: &acct.Access,
-		}},
+		AccessControlPolicy: &auth.AccessControlPolicy{
+			Owner: &types.Owner{
+				ID: &acct.Access,
+			}},
 		ACL: types.BucketCannedACL(acl),
-	}, defACL, c.iam)
+	}, defACL, c.iam, acct.Role == auth.RoleAdmin)
 	if err != nil {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "CreateBucket",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionCreateBucket,
 				BucketOwner: acct.Access,
 			})
 	}
 
+	lockHeader := ctx.Get("X-Amz-Bucket-Object-Lock-Enabled")
+	// CLI provides "True", SDK - "true"
+	lockEnabled := lockHeader == "True" || lockHeader == "true"
+
 	err = c.be.CreateBucket(ctx.Context(), &s3.CreateBucketInput{
-		Bucket:          &bucket,
-		ObjectOwnership: types.ObjectOwnership(acct.Access),
+		Bucket:                     &bucket,
+		ObjectOwnership:            objectOwnership,
+		ObjectLockEnabledForBucket: &lockEnabled,
 	}, updAcl)
 	return SendResponse(ctx, err,
 		&MetaOpts{
 			Logger:      c.logger,
-			Action:      "CreateBucket",
+			MetricsMng:  c.mm,
+			Action:      metrics.ActionCreateBucket,
 			BucketOwner: acct.Access,
 		})
 }
@@ -1220,16 +1644,22 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 	versionId := ctx.Query("versionId")
 	acct := ctx.Locals("account").(auth.Account)
 	isRoot := ctx.Locals("isRoot").(bool)
+	contentType := ctx.Get("Content-Type")
+	contentEncoding := ctx.Get("Content-Encoding")
 	parsedAcl := ctx.Locals("parsedAcl").(auth.ACL)
 	tagging := ctx.Get("x-amz-tagging")
 
 	// Copy source headers
 	copySource := ctx.Get("X-Amz-Copy-Source")
+	if len(copySource) > 0 && copySource[0] == '/' {
+		copySource = copySource[1:]
+	}
 	copySrcIfMatch := ctx.Get("X-Amz-Copy-Source-If-Match")
 	copySrcIfNoneMatch := ctx.Get("X-Amz-Copy-Source-If-None-Match")
 	copySrcModifSince := ctx.Get("X-Amz-Copy-Source-If-Modified-Since")
 	copySrcUnmodifSince := ctx.Get("X-Amz-Copy-Source-If-Unmodified-Since")
 	copySrcRange := ctx.Get("X-Amz-Copy-Source-Range")
+	directive := ctx.Get("X-Amz-Metadata-Directive")
 
 	// Permission headers
 	acl := ctx.Get("X-Amz-Acl")
@@ -1239,12 +1669,21 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 	granWrite := ctx.Get("X-Amz-Grant-Write")
 	grantWriteACP := ctx.Get("X-Amz-Grant-Write-Acp")
 
-	// Other headers
+	// Content Length
 	contentLengthStr := ctx.Get("Content-Length")
 	if contentLengthStr == "" {
 		contentLengthStr = "0"
 	}
+	// Use decoded content length if available because the
+	// middleware will decode the chunked transfer encoding
+	decodedLength := ctx.Get("X-Amz-Decoded-Content-Length")
+	if decodedLength != "" {
+		contentLengthStr = decodedLength
+	}
+
+	// Other headers
 	bucketOwner := ctx.Get("X-Amz-Expected-Bucket-Owner")
+	storageClass := ctx.Get("X-Amz-Storage-Class")
 
 	grants := grantFullControl + grantRead + grantReadACP + granWrite + grantWriteACP
 
@@ -1266,7 +1705,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidRequest),
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutObjectTagging",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutObjectTagging,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -1282,7 +1722,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 				return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidTag),
 					&MetaOpts{
 						Logger:      c.logger,
-						Action:      "PutObjectTagging",
+						MetricsMng:  c.mm,
+						Action:      metrics.ActionPutObjectTagging,
 						BucketOwner: parsedAcl.Owner,
 					})
 			}
@@ -1290,6 +1731,7 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 		}
 
 		err = auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionWrite,
 			IsRoot:        isRoot,
@@ -1302,7 +1744,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutObjectTagging",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutObjectTagging,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -1311,8 +1754,9 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
+				MetricsMng:  c.mm,
 				EvSender:    c.evSender,
-				Action:      "PutObjectTagging",
+				Action:      metrics.ActionPutObjectTagging,
 				BucketOwner: parsedAcl.Owner,
 				EventName:   s3event.EventObjectTaggingPut,
 			})
@@ -1320,6 +1764,7 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 
 	if ctx.Request().URI().QueryArgs().Has("retention") {
 		if err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionWrite,
 			IsRoot:        isRoot,
@@ -1331,24 +1776,40 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutObjectRetention",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutObjectRetention,
 					BucketOwner: parsedAcl.Owner,
 				})
+		}
+
+		bypassHdr := ctx.Get("X-Amz-Bypass-Governance-Retention")
+		bypass := strings.EqualFold(bypassHdr, "true")
+		if bypass {
+			policy, err := c.be.GetBucketPolicy(ctx.Context(), bucket)
+			if err != nil {
+				bypass = false
+			} else {
+				if err := auth.VerifyBucketPolicy(policy, acct.Access, bucket, keyStart, auth.BypassGovernanceRetentionAction); err != nil {
+					bypass = false
+				}
+			}
 		}
 
 		retention, err := auth.ParseObjectLockRetentionInput(ctx.Body())
 		if err != nil {
 			return SendResponse(ctx, err, &MetaOpts{
 				Logger:      c.logger,
-				Action:      "PutObjectRetention",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionPutObjectRetention,
 				BucketOwner: parsedAcl.Owner,
 			})
 		}
 
-		err = c.be.PutObjectRetention(ctx.Context(), bucket, keyStart, versionId, retention)
+		err = c.be.PutObjectRetention(ctx.Context(), bucket, keyStart, versionId, bypass, retention)
 		return SendResponse(ctx, err, &MetaOpts{
 			Logger:      c.logger,
-			Action:      "PutObjectRetention",
+			MetricsMng:  c.mm,
+			Action:      metrics.ActionPutObjectRetention,
 			BucketOwner: parsedAcl.Owner,
 		})
 	}
@@ -1356,14 +1817,27 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 	if ctx.Request().URI().QueryArgs().Has("legal-hold") {
 		var legalHold types.ObjectLockLegalHold
 		if err := xml.Unmarshal(ctx.Body(), &legalHold); err != nil {
-			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidRequest), &MetaOpts{
-				Logger:      c.logger,
-				Action:      "PutObjectLegalHold",
-				BucketOwner: parsedAcl.Owner,
-			})
+			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidRequest),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutObjectLegalHold,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
+		if legalHold.Status != types.ObjectLockLegalHoldStatusOff && legalHold.Status != types.ObjectLockLegalHoldStatusOn {
+			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrMalformedXML),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutObjectLegalHold,
+					BucketOwner: parsedAcl.Owner,
+				})
 		}
 
 		if err := auth.VerifyAccess(ctx.Context(), c.be, auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionWrite,
 			IsRoot:        isRoot,
@@ -1375,7 +1849,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "PutObjectLegalHold",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionPutObjectLegalHold,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -1383,7 +1858,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 		err := c.be.PutObjectLegalHold(ctx.Context(), bucket, keyStart, versionId, legalHold.Status == types.ObjectLockLegalHoldStatusOn)
 		return SendResponse(ctx, err, &MetaOpts{
 			Logger:      c.logger,
-			Action:      "PutObjectLegalHold",
+			MetricsMng:  c.mm,
+			Action:      metrics.ActionPutObjectLegalHold,
 			BucketOwner: parsedAcl.Owner,
 		})
 	}
@@ -1391,21 +1867,40 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 	if ctx.Request().URI().QueryArgs().Has("uploadId") &&
 		ctx.Request().URI().QueryArgs().Has("partNumber") &&
 		copySource != "" {
+
+		cs := copySource
+		copySource, err := url.QueryUnescape(copySource)
+		if err != nil {
+			if c.debug {
+				log.Printf("error unescaping copy source %q: %v",
+					cs, err)
+			}
+			return SendXMLResponse(ctx, nil,
+				s3err.GetAPIError(s3err.ErrInvalidCopySource),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionUploadPartCopy,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
 		partNumber := int32(ctx.QueryInt("partNumber", -1))
 		if partNumber < 1 || partNumber > 10000 {
 			if c.debug {
 				log.Printf("invalid part number: %d", partNumber)
 			}
 			return SendXMLResponse(ctx, nil,
-				s3err.GetAPIError(s3err.ErrInvalidPart),
+				s3err.GetAPIError(s3err.ErrInvalidPartNumber),
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "UploadPartCopy",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionUploadPartCopy,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
 
-		err := auth.VerifyObjectCopyAccess(ctx.Context(), c.be, copySource,
+		err = auth.VerifyObjectCopyAccess(ctx.Context(), c.be, copySource,
 			auth.AccessOptions{
 				Acl:           parsedAcl,
 				AclPermission: types.PermissionWrite,
@@ -1419,7 +1914,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "UploadPartCopy",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionUploadPartCopy,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -1434,10 +1930,19 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 				ExpectedBucketOwner: &bucketOwner,
 				CopySourceRange:     &copySrcRange,
 			})
+		if err == nil && resp.CopySourceVersionId != "" {
+			utils.SetResponseHeaders(ctx, []utils.CustomHeader{
+				{
+					Key:   "x-amz-copy-source-version-id",
+					Value: resp.CopySourceVersionId,
+				},
+			})
+		}
 		return SendXMLResponse(ctx, resp, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "UploadPartCopy",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionUploadPartCopy,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
@@ -1452,13 +1957,15 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidPart),
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "UploadPart",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionUploadPart,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
 
 		err := auth.VerifyAccess(ctx.Context(), c.be,
 			auth.AccessOptions{
+				Readonly:      c.readonly,
 				Acl:           parsedAcl,
 				AclPermission: types.PermissionWrite,
 				IsRoot:        isRoot,
@@ -1471,7 +1978,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "UploadPart",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionUploadPart,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -1485,7 +1993,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidRequest),
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "UploadPart",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionUploadPart,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -1511,9 +2020,11 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 		ctx.Response().Header.Set("Etag", etag)
 		return SendResponse(ctx, err,
 			&MetaOpts{
-				Logger:      c.logger,
-				Action:      "UploadPart",
-				BucketOwner: parsedAcl.Owner,
+				Logger:        c.logger,
+				MetricsMng:    c.mm,
+				ContentLength: contentLength,
+				Action:        metrics.ActionUploadPart,
+				BucketOwner:   parsedAcl.Owner,
 			})
 	}
 
@@ -1530,7 +2041,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 					s3err.GetAPIError(s3err.ErrInvalidRequest),
 					&MetaOpts{
 						Logger:      c.logger,
-						Action:      "PutObjectAcl",
+						MetricsMng:  c.mm,
+						Action:      metrics.ActionPutObjectAcl,
 						BucketOwner: parsedAcl.Owner,
 					})
 			}
@@ -1546,9 +2058,23 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 					s3err.GetAPIError(s3err.ErrInvalidRequest),
 					&MetaOpts{
 						Logger:      c.logger,
-						Action:      "PutObjectAcl",
+						MetricsMng:  c.mm,
+						Action:      metrics.ActionPutObjectAcl,
 						BucketOwner: parsedAcl.Owner,
 					})
+			}
+
+			//TODO: This part will be changed when object acls are implemented
+
+			grants := []types.Grant{}
+			for _, grt := range accessControlPolicy.AccessControlList.Grants {
+				grants = append(grants, types.Grant{
+					Grantee: &types.Grantee{
+						ID:   &grt.Grantee.ID,
+						Type: grt.Grantee.Type,
+					},
+					Permission: grt.Permission,
+				})
 			}
 
 			input = &s3.PutObjectAclInput{
@@ -1556,8 +2082,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 				Key:    &keyStart,
 				ACL:    "",
 				AccessControlPolicy: &types.AccessControlPolicy{
-					Owner:  &accessControlPolicy.Owner,
-					Grants: accessControlPolicy.AccessControlList.Grants,
+					Owner:  accessControlPolicy.Owner,
+					Grants: grants,
 				},
 			}
 		}
@@ -1570,7 +2096,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 					s3err.GetAPIError(s3err.ErrInvalidRequest),
 					&MetaOpts{
 						Logger:      c.logger,
-						Action:      "PutObjectAcl",
+						MetricsMng:  c.mm,
+						Action:      metrics.ActionPutObjectAcl,
 						BucketOwner: parsedAcl.Owner,
 					})
 			}
@@ -1583,7 +2110,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 					s3err.GetAPIError(s3err.ErrInvalidRequest),
 					&MetaOpts{
 						Logger:      c.logger,
-						Action:      "PutObjectAcl",
+						MetricsMng:  c.mm,
+						Action:      metrics.ActionPutObjectAcl,
 						BucketOwner: parsedAcl.Owner,
 					})
 			}
@@ -1617,15 +2145,33 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
+				MetricsMng:  c.mm,
 				EvSender:    c.evSender,
-				Action:      "PutObjectAcl",
+				Action:      metrics.ActionPutObjectAcl,
 				BucketOwner: parsedAcl.Owner,
 				EventName:   s3event.EventObjectAclPut,
 			})
 	}
 
 	if copySource != "" {
-		err := auth.VerifyObjectCopyAccess(ctx.Context(), c.be, copySource,
+		cs := copySource
+		copySource, err := url.QueryUnescape(copySource)
+		if err != nil {
+			if c.debug {
+				log.Printf("error unescaping copy source %q: %v",
+					cs, err)
+			}
+			return SendXMLResponse(ctx, nil,
+				s3err.GetAPIError(s3err.ErrInvalidCopySource),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionCopyObject,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
+		err = auth.VerifyObjectCopyAccess(ctx.Context(), c.be, copySource,
 			auth.AccessOptions{
 				Acl:           parsedAcl,
 				AclPermission: types.PermissionWrite,
@@ -1639,7 +2185,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "CopyObject",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionCopyObject,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -1657,7 +2204,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 					s3err.GetAPIError(s3err.ErrInvalidCopySource),
 					&MetaOpts{
 						Logger:      c.logger,
-						Action:      "CopyObject",
+						MetricsMng:  c.mm,
+						Action:      metrics.ActionCopyObject,
 						BucketOwner: parsedAcl.Owner,
 					})
 			}
@@ -1674,7 +2222,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 					s3err.GetAPIError(s3err.ErrInvalidCopySource),
 					&MetaOpts{
 						Logger:      c.logger,
-						Action:      "CopyObject",
+						MetricsMng:  c.mm,
+						Action:      metrics.ActionCopyObject,
 						BucketOwner: parsedAcl.Owner,
 					})
 			}
@@ -1682,6 +2231,22 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 		}
 
 		metadata := utils.GetUserMetaData(&ctx.Request().Header)
+
+		if directive != "" && directive != "COPY" && directive != "REPLACE" {
+			return SendXMLResponse(ctx, nil,
+				s3err.GetAPIError(s3err.ErrInvalidMetadataDirective),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionCopyObject,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
+		metaDirective := types.MetadataDirectiveCopy
+		if directive == "REPLACE" {
+			metaDirective = types.MetadataDirectiveReplace
+		}
 
 		res, err := c.be.CopyObject(ctx.Context(),
 			&s3.CopyObjectInput{
@@ -1694,13 +2259,31 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 				CopySourceIfUnmodifiedSince: umtime,
 				ExpectedBucketOwner:         &acct.Access,
 				Metadata:                    metadata,
+				MetadataDirective:           metaDirective,
+				StorageClass:                types.StorageClass(storageClass),
 			})
 		if err == nil {
-			return SendXMLResponse(ctx, res, err,
+			hdrs := []utils.CustomHeader{}
+			if getstring(res.VersionId) != "" {
+				hdrs = append(hdrs, utils.CustomHeader{
+					Key:   "x-amz-version-id",
+					Value: getstring(res.VersionId),
+				})
+			}
+			if getstring(res.CopySourceVersionId) != "" {
+				hdrs = append(hdrs, utils.CustomHeader{
+					Key:   "x-amz-copy-source-version-id",
+					Value: getstring(res.CopySourceVersionId),
+				})
+			}
+			utils.SetResponseHeaders(ctx, hdrs)
+
+			return SendXMLResponse(ctx, res.CopyObjectResult, err,
 				&MetaOpts{
 					Logger:      c.logger,
+					MetricsMng:  c.mm,
 					EvSender:    c.evSender,
-					Action:      "CopyObject",
+					Action:      metrics.ActionCopyObject,
 					BucketOwner: parsedAcl.Owner,
 					ObjectETag:  res.CopyObjectResult.ETag,
 					VersionId:   res.VersionId,
@@ -1710,7 +2293,8 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, res, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "CopyObject",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionCopyObject,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -1720,6 +2304,7 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 
 	err := auth.VerifyAccess(ctx.Context(), c.be,
 		auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionWrite,
 			IsRoot:        isRoot,
@@ -1732,17 +2317,19 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "PutObject",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionPutObject,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
-	err = auth.CheckObjectAccess(ctx.Context(), bucket, acct.Access, []string{keyStart}, isRoot || acct.Role == auth.RoleAdmin, c.be)
+	err = auth.CheckObjectAccess(ctx.Context(), bucket, acct.Access, []types.ObjectIdentifier{{Key: &keyStart}}, true, c.be)
 	if err != nil {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "PutObject",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionPutObject,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
@@ -1756,7 +2343,19 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidRequest),
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "PutObject",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionPutObject,
+				BucketOwner: parsedAcl.Owner,
+			})
+	}
+
+	objLock, err := utils.ParsObjectLockHdrs(ctx)
+	if err != nil {
+		return SendResponse(ctx, err,
+			&MetaOpts{
+				Logger:      c.logger,
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionPutObject,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
@@ -1770,25 +2369,60 @@ func (c S3ApiController) PutActions(ctx *fiber.Ctx) error {
 	}
 
 	ctx.Locals("logReqBody", false)
-	etag, err := c.be.PutObject(ctx.Context(),
+	res, err := c.be.PutObject(ctx.Context(),
 		&s3.PutObjectInput{
-			Bucket:        &bucket,
-			Key:           &keyStart,
-			ContentLength: &contentLength,
-			Metadata:      metadata,
-			Body:          body,
-			Tagging:       &tagging,
+			Bucket:                    &bucket,
+			Key:                       &keyStart,
+			ContentLength:             &contentLength,
+			ContentType:               &contentType,
+			ContentEncoding:           &contentEncoding,
+			Metadata:                  metadata,
+			Body:                      body,
+			Tagging:                   &tagging,
+			ObjectLockRetainUntilDate: &objLock.RetainUntilDate,
+			ObjectLockMode:            objLock.ObjectLockMode,
+			ObjectLockLegalHoldStatus: objLock.LegalHoldStatus,
 		})
-	ctx.Response().Header.Set("ETag", etag)
-	return SendResponse(ctx, err,
+	if err != nil {
+		return SendResponse(ctx, err,
+			&MetaOpts{
+				Logger:        c.logger,
+				MetricsMng:    c.mm,
+				ContentLength: contentLength,
+				EvSender:      c.evSender,
+				Action:        metrics.ActionPutObject,
+				BucketOwner:   parsedAcl.Owner,
+				ObjectSize:    contentLength,
+				EventName:     s3event.EventObjectCreatedPut,
+			})
+	}
+	hdrs := []utils.CustomHeader{
+		{
+			Key:   "ETag",
+			Value: res.ETag,
+		},
+	}
+
+	if res.VersionID != "" {
+		hdrs = append(hdrs, utils.CustomHeader{
+			Key:   "x-amz-version-id",
+			Value: res.VersionID,
+		})
+	}
+
+	utils.SetResponseHeaders(ctx, hdrs)
+
+	return SendResponse(ctx, nil,
 		&MetaOpts{
-			Logger:      c.logger,
-			EvSender:    c.evSender,
-			Action:      "PutObject",
-			BucketOwner: parsedAcl.Owner,
-			ObjectETag:  &etag,
-			ObjectSize:  contentLength,
-			EventName:   s3event.EventObjectCreatedPut,
+			Logger:        c.logger,
+			MetricsMng:    c.mm,
+			ContentLength: contentLength,
+			EvSender:      c.evSender,
+			Action:        metrics.ActionPutObject,
+			BucketOwner:   parsedAcl.Owner,
+			ObjectETag:    &res.ETag,
+			ObjectSize:    contentLength,
+			EventName:     s3event.EventObjectCreatedPut,
 		})
 }
 
@@ -1801,6 +2435,7 @@ func (c S3ApiController) DeleteBucket(ctx *fiber.Ctx) error {
 	if ctx.Request().URI().QueryArgs().Has("tagging") {
 		err := auth.VerifyAccess(ctx.Context(), c.be,
 			auth.AccessOptions{
+				Readonly:      c.readonly,
 				Acl:           parsedAcl,
 				AclPermission: types.PermissionWrite,
 				IsRoot:        isRoot,
@@ -1812,7 +2447,8 @@ func (c S3ApiController) DeleteBucket(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "DeleteBucketTagging",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionDeleteBucketTagging,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -1821,7 +2457,40 @@ func (c S3ApiController) DeleteBucket(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "DeleteBucketTagging",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionDeleteBucketTagging,
+				BucketOwner: parsedAcl.Owner,
+				Status:      http.StatusNoContent,
+			})
+	}
+
+	if ctx.Request().URI().QueryArgs().Has("ownershipControls") {
+		err := auth.VerifyAccess(ctx.Context(), c.be,
+			auth.AccessOptions{
+				Readonly:      c.readonly,
+				Acl:           parsedAcl,
+				AclPermission: types.PermissionWrite,
+				IsRoot:        isRoot,
+				Acc:           acct,
+				Bucket:        bucket,
+				Action:        auth.PutBucketOwnershipControlsAction,
+			})
+		if err != nil {
+			return SendResponse(ctx, err,
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionDeleteBucketOwnershipControls,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
+		err = c.be.DeleteBucketOwnershipControls(ctx.Context(), bucket)
+		return SendResponse(ctx, err,
+			&MetaOpts{
+				Logger:      c.logger,
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionDeleteBucketOwnershipControls,
 				BucketOwner: parsedAcl.Owner,
 				Status:      http.StatusNoContent,
 			})
@@ -1830,6 +2499,7 @@ func (c S3ApiController) DeleteBucket(ctx *fiber.Ctx) error {
 	if ctx.Request().URI().QueryArgs().Has("policy") {
 		err := auth.VerifyAccess(ctx.Context(), c.be,
 			auth.AccessOptions{
+				Readonly:      c.readonly,
 				Acl:           parsedAcl,
 				AclPermission: types.PermissionWrite,
 				IsRoot:        isRoot,
@@ -1841,7 +2511,8 @@ func (c S3ApiController) DeleteBucket(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "DeleteBucketPolicy",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionDeleteBucketPolicy,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -1850,7 +2521,8 @@ func (c S3ApiController) DeleteBucket(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "DeleteBucketPolicy",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionDeleteBucketPolicy,
 				BucketOwner: parsedAcl.Owner,
 				Status:      http.StatusNoContent,
 			})
@@ -1858,6 +2530,7 @@ func (c S3ApiController) DeleteBucket(ctx *fiber.Ctx) error {
 
 	err := auth.VerifyAccess(ctx.Context(), c.be,
 		auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionWrite,
 			IsRoot:        isRoot,
@@ -1869,19 +2542,18 @@ func (c S3ApiController) DeleteBucket(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "DeleteBucket",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionDeleteBucket,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
-	err = c.be.DeleteBucket(ctx.Context(),
-		&s3.DeleteBucketInput{
-			Bucket: &bucket,
-		})
+	err = c.be.DeleteBucket(ctx.Context(), bucket)
 	return SendResponse(ctx, err,
 		&MetaOpts{
 			Logger:      c.logger,
-			Action:      "DeleteBucket",
+			MetricsMng:  c.mm,
+			Action:      metrics.ActionDeleteBucket,
 			BucketOwner: parsedAcl.Owner,
 			Status:      http.StatusNoContent,
 		})
@@ -1892,6 +2564,7 @@ func (c S3ApiController) DeleteObjects(ctx *fiber.Ctx) error {
 	acct := ctx.Locals("account").(auth.Account)
 	isRoot := ctx.Locals("isRoot").(bool)
 	parsedAcl := ctx.Locals("parsedAcl").(auth.ACL)
+	bypassHdr := ctx.Get("X-Amz-Bypass-Governance-Retention")
 	var dObj s3response.DeleteObjects
 
 	err := xml.Unmarshal(ctx.Body(), &dObj)
@@ -1902,13 +2575,15 @@ func (c S3ApiController) DeleteObjects(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidRequest),
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "DeleteObjects",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionDeleteObjects,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	err = auth.VerifyAccess(ctx.Context(), c.be,
 		auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionWrite,
 			IsRoot:        isRoot,
@@ -1920,17 +2595,22 @@ func (c S3ApiController) DeleteObjects(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "DeleteObjects",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionDeleteObjects,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
-	err = auth.CheckObjectAccess(ctx.Context(), bucket, acct.Access, utils.ParseDeleteObjects(dObj.Objects), isRoot || acct.Role == auth.RoleAdmin, c.be)
+	// The AWS CLI sends 'True', while Go SDK sends 'true'
+	bypass := strings.EqualFold(bypassHdr, "true")
+
+	err = auth.CheckObjectAccess(ctx.Context(), bucket, acct.Access, dObj.Objects, bypass, c.be)
 	if err != nil {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "DeleteObjects",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionDeleteObjects,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
@@ -1945,8 +2625,12 @@ func (c S3ApiController) DeleteObjects(ctx *fiber.Ctx) error {
 	return SendXMLResponse(ctx, res, err,
 		&MetaOpts{
 			Logger:      c.logger,
-			Action:      "DeleteObjects",
+			MetricsMng:  c.mm,
+			Action:      metrics.ActionDeleteObjects,
+			ObjectCount: int64(len(dObj.Objects)),
 			BucketOwner: parsedAcl.Owner,
+			EvSender:    c.evSender,
+			EventName:   s3event.EventObjectRemovedDeleteObjects,
 		})
 }
 
@@ -1959,14 +2643,20 @@ func (c S3ApiController) DeleteActions(ctx *fiber.Ctx) error {
 	acct := ctx.Locals("account").(auth.Account)
 	isRoot := ctx.Locals("isRoot").(bool)
 	parsedAcl := ctx.Locals("parsedAcl").(auth.ACL)
+	bypassHdr := ctx.Get("X-Amz-Bypass-Governance-Retention")
 
 	if keyEnd != "" {
 		key = strings.Join([]string{key, keyEnd}, "/")
+	}
+	path := ctx.Path()
+	if path[len(path)-1:] == "/" && key[len(key)-1:] != "/" {
+		key = key + "/"
 	}
 
 	if ctx.Request().URI().QueryArgs().Has("tagging") {
 		err := auth.VerifyAccess(ctx.Context(), c.be,
 			auth.AccessOptions{
+				Readonly:      c.readonly,
 				Acl:           parsedAcl,
 				AclPermission: types.PermissionWrite,
 				IsRoot:        isRoot,
@@ -1979,7 +2669,8 @@ func (c S3ApiController) DeleteActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "DeleteObjectTagging",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionDeleteObjectTagging,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -1989,8 +2680,9 @@ func (c S3ApiController) DeleteActions(ctx *fiber.Ctx) error {
 			&MetaOpts{
 				Status:      http.StatusNoContent,
 				Logger:      c.logger,
+				MetricsMng:  c.mm,
 				EvSender:    c.evSender,
-				Action:      "DeleteObjectTagging",
+				Action:      metrics.ActionDeleteObjectTagging,
 				BucketOwner: parsedAcl.Owner,
 				EventName:   s3event.EventObjectTaggingDelete,
 			})
@@ -2002,6 +2694,7 @@ func (c S3ApiController) DeleteActions(ctx *fiber.Ctx) error {
 
 		err := auth.VerifyAccess(ctx.Context(), c.be,
 			auth.AccessOptions{
+				Readonly:      c.readonly,
 				Acl:           parsedAcl,
 				AclPermission: types.PermissionWrite,
 				IsRoot:        isRoot,
@@ -2014,7 +2707,8 @@ func (c S3ApiController) DeleteActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "AbortMultipartUpload",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionAbortMultipartUpload,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -2030,14 +2724,18 @@ func (c S3ApiController) DeleteActions(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "AbortMultipartUpload",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionAbortMultipartUpload,
 				BucketOwner: parsedAcl.Owner,
 				Status:      http.StatusNoContent,
 			})
 	}
 
+	//TODO: check s3:DeleteObjectVersion policy in case a use tries to delete a version of an object
+
 	err := auth.VerifyAccess(ctx.Context(), c.be,
 		auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionWrite,
 			IsRoot:        isRoot,
@@ -2050,34 +2748,69 @@ func (c S3ApiController) DeleteActions(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "DeleteObject",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionDeleteObject,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
-	err = auth.CheckObjectAccess(ctx.Context(), bucket, acct.Access, []string{key}, isRoot || acct.Role == auth.RoleAdmin, c.be)
+	// The AWS CLI sends 'True', while Go SDK sends 'true'
+	bypass := strings.EqualFold(bypassHdr, "true")
+
+	err = auth.CheckObjectAccess(ctx.Context(), bucket, acct.Access, []types.ObjectIdentifier{{Key: &key, VersionId: &versionId}}, bypass, c.be)
 	if err != nil {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "DeleteObject",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionDeleteObject,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
-	err = c.be.DeleteObject(ctx.Context(),
+	res, err := c.be.DeleteObject(ctx.Context(),
 		&s3.DeleteObjectInput{
 			Bucket:    &bucket,
 			Key:       &key,
 			VersionId: &versionId,
 		})
-	return SendResponse(ctx, err,
+	if err != nil {
+		return SendResponse(ctx, err,
+			&MetaOpts{
+				Logger:      c.logger,
+				MetricsMng:  c.mm,
+				EvSender:    c.evSender,
+				Action:      metrics.ActionDeleteObject,
+				BucketOwner: parsedAcl.Owner,
+				EventName:   s3event.EventObjectRemovedDelete,
+				Status:      http.StatusNoContent,
+			})
+	}
+
+	hdrs := []utils.CustomHeader{}
+	if res.VersionId != nil && *res.VersionId != "" {
+		hdrs = append(hdrs, utils.CustomHeader{
+			Key:   "x-amz-version-id",
+			Value: *res.VersionId,
+		})
+	}
+	if res.DeleteMarker != nil && *res.DeleteMarker {
+		hdrs = append(hdrs, utils.CustomHeader{
+			Key:   "x-amz-delete-marker",
+			Value: "true",
+		})
+	}
+
+	utils.SetResponseHeaders(ctx, hdrs)
+
+	return SendResponse(ctx, nil,
 		&MetaOpts{
 			Logger:      c.logger,
+			MetricsMng:  c.mm,
 			EvSender:    c.evSender,
-			Action:      "DeleteObject",
+			Action:      metrics.ActionDeleteObject,
 			BucketOwner: parsedAcl.Owner,
-			EventName:   s3event.EventObjectDeleted,
+			EventName:   s3event.EventObjectRemovedDelete,
 			Status:      http.StatusNoContent,
 		})
 }
@@ -2091,6 +2824,7 @@ func (c S3ApiController) HeadBucket(ctx *fiber.Ctx) error {
 
 	err := auth.VerifyAccess(ctx.Context(), c.be,
 		auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -2102,7 +2836,8 @@ func (c S3ApiController) HeadBucket(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "HeadBucket",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionHeadBucket,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
@@ -2125,7 +2860,8 @@ func (c S3ApiController) HeadBucket(ctx *fiber.Ctx) error {
 	return SendResponse(ctx, err,
 		&MetaOpts{
 			Logger:      c.logger,
-			Action:      "HeadBucket",
+			MetricsMng:  c.mm,
+			Action:      metrics.ActionHeadBucket,
 			BucketOwner: parsedAcl.Owner,
 		})
 }
@@ -2139,14 +2875,39 @@ func (c S3ApiController) HeadObject(ctx *fiber.Ctx) error {
 	acct := ctx.Locals("account").(auth.Account)
 	isRoot := ctx.Locals("isRoot").(bool)
 	parsedAcl := ctx.Locals("parsedAcl").(auth.ACL)
+	partNumberQuery := int32(ctx.QueryInt("partNumber", -1))
+	versionId := ctx.Query("versionId")
 	key := ctx.Params("key")
 	keyEnd := ctx.Params("*1")
 	if keyEnd != "" {
 		key = strings.Join([]string{key, keyEnd}, "/")
 	}
+	path := ctx.Path()
+	if path[len(path)-1:] == "/" && key[len(key)-1:] != "/" {
+		key = key + "/"
+	}
+
+	var partNumber *int32
+	if ctx.Request().URI().QueryArgs().Has("partNumber") {
+		if partNumberQuery < 1 || partNumberQuery > 10000 {
+			if c.debug {
+				log.Printf("invalid part number: %d", partNumberQuery)
+			}
+			return SendResponse(ctx, s3err.GetAPIError(s3err.ErrInvalidPartNumber),
+				&MetaOpts{
+					Logger:      c.logger,
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionHeadObject,
+					BucketOwner: parsedAcl.Owner,
+				})
+		}
+
+		partNumber = &partNumberQuery
+	}
 
 	err := auth.VerifyAccess(ctx.Context(), c.be,
 		auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionRead,
 			IsRoot:        isRoot,
@@ -2159,73 +2920,124 @@ func (c S3ApiController) HeadObject(ctx *fiber.Ctx) error {
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "HeadObject",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionHeadObject,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	res, err := c.be.HeadObject(ctx.Context(),
 		&s3.HeadObjectInput{
-			Bucket: &bucket,
-			Key:    &key,
+			Bucket:     &bucket,
+			Key:        &key,
+			PartNumber: partNumber,
+			VersionId:  &versionId,
 		})
 	if err != nil {
+		if res != nil {
+			utils.SetResponseHeaders(ctx, []utils.CustomHeader{
+				{
+					Key:   "x-amz-delete-marker",
+					Value: "true",
+				},
+				{
+					Key:   "Last-Modified",
+					Value: res.LastModified.Format(timefmt),
+				},
+			})
+		}
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "HeadObject",
-				BucketOwner: parsedAcl.Owner,
-			})
-	}
-	if res == nil {
-		return SendResponse(ctx, fmt.Errorf("head object nil response"),
-			&MetaOpts{
-				Logger:      c.logger,
-				Action:      "HeadObject",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionHeadObject,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	utils.SetMetaHeaders(ctx, res.Metadata)
-	var lastmod string
-	if res.LastModified != nil {
-		lastmod = res.LastModified.Format(timefmt)
-	}
-	utils.SetResponseHeaders(ctx, []utils.CustomHeader{
+	headers := []utils.CustomHeader{
 		{
 			Key:   "Content-Length",
 			Value: fmt.Sprint(getint64(res.ContentLength)),
-		},
-		{
-			Key:   "Content-Type",
-			Value: getstring(res.ContentType),
-		},
-		{
-			Key:   "Content-Encoding",
-			Value: getstring(res.ContentEncoding),
 		},
 		{
 			Key:   "ETag",
 			Value: getstring(res.ETag),
 		},
 		{
-			Key:   "Last-Modified",
-			Value: lastmod,
-		},
-		{
-			Key:   "x-amz-storage-class",
-			Value: string(res.StorageClass),
-		},
-		{
 			Key:   "x-amz-restore",
 			Value: getstring(res.Restore),
 		},
+	}
+	if res.ObjectLockMode != "" {
+		headers = append(headers, utils.CustomHeader{
+			Key:   "x-amz-object-lock-mode",
+			Value: string(res.ObjectLockMode),
+		})
+	}
+	if res.ObjectLockLegalHoldStatus != "" {
+		headers = append(headers, utils.CustomHeader{
+			Key:   "x-amz-object-lock-legal-hold",
+			Value: string(res.ObjectLockLegalHoldStatus),
+		})
+	}
+	if res.ObjectLockRetainUntilDate != nil {
+		retainUntilDate := res.ObjectLockRetainUntilDate.Format(time.RFC3339)
+		headers = append(headers, utils.CustomHeader{
+			Key:   "x-amz-object-lock-retain-until-date",
+			Value: retainUntilDate,
+		})
+	}
+	if res.PartsCount != nil {
+		headers = append(headers, utils.CustomHeader{
+			Key:   "x-amz-mp-parts-count",
+			Value: fmt.Sprintf("%v", *res.PartsCount),
+		})
+	}
+	if res.LastModified != nil {
+		lastmod := res.LastModified.Format(timefmt)
+		headers = append(headers, utils.CustomHeader{
+			Key:   "Last-Modified",
+			Value: lastmod,
+		})
+	}
+	if res.ContentEncoding != nil {
+		headers = append(headers, utils.CustomHeader{
+			Key:   "Content-Encoding",
+			Value: getstring(res.ContentEncoding),
+		})
+	}
+	if res.StorageClass != "" {
+		headers = append(headers, utils.CustomHeader{
+			Key:   "x-amz-storage-class",
+			Value: string(res.StorageClass),
+		})
+	}
+
+	contentType := getstring(res.ContentType)
+	if contentType == "" {
+		contentType = defaultContentType
+	}
+	headers = append(headers, utils.CustomHeader{
+		Key:   "Content-Type",
+		Value: contentType,
 	})
+
+	if getstring(res.VersionId) != "" {
+		headers = append(headers, utils.CustomHeader{
+			Key:   "x-amz-version-id",
+			Value: getstring(res.VersionId),
+		})
+	}
+
+	utils.SetResponseHeaders(ctx, headers)
 
 	return SendResponse(ctx, nil,
 		&MetaOpts{
 			Logger:      c.logger,
-			Action:      "HeadObject",
+			MetricsMng:  c.mm,
+			Action:      metrics.ActionHeadObject,
 			BucketOwner: parsedAcl.Owner,
 		})
 }
@@ -2238,6 +3050,9 @@ func (c S3ApiController) CreateActions(ctx *fiber.Ctx) error {
 	acct := ctx.Locals("account").(auth.Account)
 	isRoot := ctx.Locals("isRoot").(bool)
 	parsedAcl := ctx.Locals("parsedAcl").(auth.ACL)
+	contentType := ctx.Get("Content-Type")
+	contentEncoding := ctx.Get("Content-Encoding")
+	tagging := ctx.Get("X-Amz-Tagging")
 
 	if keyEnd != "" {
 		key = strings.Join([]string{key, keyEnd}, "/")
@@ -2248,23 +3063,22 @@ func (c S3ApiController) CreateActions(ctx *fiber.Ctx) error {
 		key = key + "/"
 	}
 
-	var restoreRequest s3.RestoreObjectInput
 	if ctx.Request().URI().QueryArgs().Has("restore") {
-		err := xml.Unmarshal(ctx.Body(), &restoreRequest)
-		if err != nil {
-			if c.debug {
-				log.Printf("error unmarshalling restore object: %v", err)
+		var restoreRequest types.RestoreRequest
+		if err := xml.Unmarshal(ctx.Body(), &restoreRequest); err != nil {
+			if !errors.Is(err, io.EOF) {
+				return SendResponse(ctx, s3err.GetAPIError(s3err.ErrMalformedXML),
+					&MetaOpts{
+						Logger:      c.logger,
+						MetricsMng:  c.mm,
+						Action:      metrics.ActionRestoreObject,
+						BucketOwner: parsedAcl.Owner,
+					})
 			}
-			return SendResponse(ctx, err,
-				&MetaOpts{
-					Logger:      c.logger,
-					Action:      "RestoreObject",
-					BucketOwner: parsedAcl.Owner,
-				})
 		}
-
-		err = auth.VerifyAccess(ctx.Context(), c.be,
+		err := auth.VerifyAccess(ctx.Context(), c.be,
 			auth.AccessOptions{
+				Readonly:      c.readonly,
 				Acl:           parsedAcl,
 				AclPermission: types.PermissionWrite,
 				IsRoot:        isRoot,
@@ -2277,20 +3091,23 @@ func (c S3ApiController) CreateActions(ctx *fiber.Ctx) error {
 			return SendResponse(ctx, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "RestoreObject",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionRestoreObject,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
 
-		restoreRequest.Bucket = &bucket
-		restoreRequest.Key = &key
-
-		err = c.be.RestoreObject(ctx.Context(), &restoreRequest)
+		err = c.be.RestoreObject(ctx.Context(), &s3.RestoreObjectInput{
+			Bucket:         &bucket,
+			Key:            &key,
+			RestoreRequest: &restoreRequest,
+		})
 		return SendResponse(ctx, err,
 			&MetaOpts{
 				Logger:      c.logger,
+				MetricsMng:  c.mm,
 				EvSender:    c.evSender,
-				Action:      "RestoreObject",
+				Action:      metrics.ActionRestoreObject,
 				BucketOwner: parsedAcl.Owner,
 				EventName:   s3event.EventObjectRestoreCompleted,
 			})
@@ -2308,13 +3125,15 @@ func (c S3ApiController) CreateActions(ctx *fiber.Ctx) error {
 				s3err.GetAPIError(s3err.ErrMalformedXML),
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "SelectObjectContent",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionSelectObjectContent,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
 
 		err = auth.VerifyAccess(ctx.Context(), c.be,
 			auth.AccessOptions{
+				Readonly:      c.readonly,
 				Acl:           parsedAcl,
 				AclPermission: types.PermissionRead,
 				IsRoot:        isRoot,
@@ -2327,7 +3146,8 @@ func (c S3ApiController) CreateActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "SelectObjectContent",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionSelectObjectContent,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -2363,13 +3183,15 @@ func (c S3ApiController) CreateActions(ctx *fiber.Ctx) error {
 				s3err.GetAPIError(s3err.ErrMalformedXML),
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "CompleteMultipartUpload",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionCompleteMultipartUpload,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
 
 		err = auth.VerifyAccess(ctx.Context(), c.be,
 			auth.AccessOptions{
+				Readonly:      c.readonly,
 				Acl:           parsedAcl,
 				AclPermission: types.PermissionWrite,
 				IsRoot:        isRoot,
@@ -2382,7 +3204,8 @@ func (c S3ApiController) CreateActions(ctx *fiber.Ctx) error {
 			return SendXMLResponse(ctx, nil, err,
 				&MetaOpts{
 					Logger:      c.logger,
-					Action:      "CompleteMultipartUpload",
+					MetricsMng:  c.mm,
+					Action:      metrics.ActionCompleteMultipartUpload,
 					BucketOwner: parsedAcl.Owner,
 				})
 		}
@@ -2397,11 +3220,20 @@ func (c S3ApiController) CreateActions(ctx *fiber.Ctx) error {
 				},
 			})
 		if err == nil {
+			if getstring(res.VersionId) != "" {
+				utils.SetResponseHeaders(ctx, []utils.CustomHeader{
+					{
+						Key:   "x-amz-version-id",
+						Value: getstring(res.VersionId),
+					},
+				})
+			}
 			return SendXMLResponse(ctx, res, err,
 				&MetaOpts{
 					Logger:      c.logger,
+					MetricsMng:  c.mm,
 					EvSender:    c.evSender,
-					Action:      "CompleteMultipartUpload",
+					Action:      metrics.ActionCompleteMultipartUpload,
 					BucketOwner: parsedAcl.Owner,
 					ObjectETag:  res.ETag,
 					EventName:   s3event.EventCompleteMultipartUpload,
@@ -2411,13 +3243,15 @@ func (c S3ApiController) CreateActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, res, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "CompleteMultipartUpload",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionCompleteMultipartUpload,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
 	err := auth.VerifyAccess(ctx.Context(), c.be,
 		auth.AccessOptions{
+			Readonly:      c.readonly,
 			Acl:           parsedAcl,
 			AclPermission: types.PermissionWrite,
 			IsRoot:        isRoot,
@@ -2430,34 +3264,59 @@ func (c S3ApiController) CreateActions(ctx *fiber.Ctx) error {
 		return SendXMLResponse(ctx, nil, err,
 			&MetaOpts{
 				Logger:      c.logger,
-				Action:      "CreateMultipartUpload",
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionCreateMultipartUpload,
 				BucketOwner: parsedAcl.Owner,
 			})
 	}
 
+	objLockState, err := utils.ParsObjectLockHdrs(ctx)
+	if err != nil {
+		return SendXMLResponse(ctx, nil, err,
+			&MetaOpts{
+				Logger:      c.logger,
+				MetricsMng:  c.mm,
+				Action:      metrics.ActionCreateMultipartUpload,
+				BucketOwner: parsedAcl.Owner,
+			})
+	}
+
+	metadata := utils.GetUserMetaData(&ctx.Request().Header)
+
 	res, err := c.be.CreateMultipartUpload(ctx.Context(),
 		&s3.CreateMultipartUploadInput{
-			Bucket: &bucket,
-			Key:    &key,
+			Bucket:                    &bucket,
+			Key:                       &key,
+			Tagging:                   &tagging,
+			ContentType:               &contentType,
+			ContentEncoding:           &contentEncoding,
+			ObjectLockRetainUntilDate: &objLockState.RetainUntilDate,
+			ObjectLockMode:            objLockState.ObjectLockMode,
+			ObjectLockLegalHoldStatus: objLockState.LegalHoldStatus,
+			Metadata:                  metadata,
 		})
 	return SendXMLResponse(ctx, res, err,
 		&MetaOpts{
 			Logger:      c.logger,
-			Action:      "CreateMultipartUpload",
+			MetricsMng:  c.mm,
+			Action:      metrics.ActionCreateMultipartUpload,
 			BucketOwner: parsedAcl.Owner,
 		})
 }
 
 type MetaOpts struct {
-	Logger      s3log.AuditLogger
-	EvSender    s3event.S3EventSender
-	Action      string
-	BucketOwner string
-	ObjectSize  int64
-	EventName   s3event.EventType
-	ObjectETag  *string
-	VersionId   *string
-	Status      int
+	Logger        s3log.AuditLogger
+	EvSender      s3event.S3EventSender
+	MetricsMng    *metrics.Manager
+	ContentLength int64
+	Action        string
+	BucketOwner   string
+	ObjectSize    int64
+	ObjectCount   int64
+	EventName     s3event.EventType
+	ObjectETag    *string
+	VersionId     *string
+	Status        int
 }
 
 func SendResponse(ctx *fiber.Ctx, err error, l *MetaOpts) error {
@@ -2467,6 +3326,13 @@ func SendResponse(ctx *fiber.Ctx, err error, l *MetaOpts) error {
 			BucketOwner: l.BucketOwner,
 			ObjectSize:  l.ObjectSize,
 		})
+	}
+	if l.MetricsMng != nil {
+		if l.ObjectCount > 0 {
+			l.MetricsMng.Send(ctx, err, l.Action, l.ObjectCount, l.Status)
+		} else {
+			l.MetricsMng.Send(ctx, err, l.Action, l.ContentLength, l.Status)
+		}
 	}
 	if err != nil {
 		var apierr s3err.APIError
@@ -2510,6 +3376,13 @@ const (
 )
 
 func SendXMLResponse(ctx *fiber.Ctx, resp any, err error, l *MetaOpts) error {
+	if l.MetricsMng != nil {
+		if l.ObjectCount > 0 {
+			l.MetricsMng.Send(ctx, err, l.Action, l.ObjectCount, l.Status)
+		} else {
+			l.MetricsMng.Send(ctx, err, l.Action, l.ContentLength, l.Status)
+		}
+	}
 	if err != nil {
 		if l.Logger != nil {
 			l.Logger.Log(ctx, err, nil, s3log.LogMeta{

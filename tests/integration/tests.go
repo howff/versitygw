@@ -1,8 +1,25 @@
+// Copyright 2023 Versity Software
+// This file is licensed under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package integration
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -11,17 +28,20 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3err"
-	"github.com/versity/versitygw/s3response"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
 	shortTimeout  = 10 * time.Second
 	iso8601Format = "20060102T150405Z"
+	nullVersionId = "null"
 )
 
 func Authentication_empty_auth_header(s *S3Conf) error {
@@ -337,11 +357,8 @@ func Authentication_credentials_future_date(s *S3Conf) error {
 		if resp.StatusCode != http.StatusForbidden {
 			return fmt.Errorf("expected response status code to be %v, instead got %v", http.StatusForbidden, resp.StatusCode)
 		}
-		if errResp.Code != "SignatureDoesNotMatch" {
-			return fmt.Errorf("expected error code to be %v, instead got %v", "SignatureDoesNotMatch", errResp.Code)
-		}
-		if !strings.Contains(errResp.Message, "Signature not yet current:") {
-			return fmt.Errorf("expected future date error message, instead got %v", errResp.Message)
+		if errResp.Code != "RequestTimeTooSkewed" {
+			return fmt.Errorf("expected error code to be %v, instead got %v", "RequestTimeTooSkewed", errResp.Code)
 		}
 
 		return nil
@@ -381,11 +398,8 @@ func Authentication_credentials_past_date(s *S3Conf) error {
 		if resp.StatusCode != http.StatusForbidden {
 			return fmt.Errorf("expected response status code to be %v, instead got %v", http.StatusForbidden, resp.StatusCode)
 		}
-		if errResp.Code != "SignatureDoesNotMatch" {
-			return fmt.Errorf("expected error code to be %v, instead got %v", "SignatureDoesNotMatch", errResp.Code)
-		}
-		if !strings.Contains(errResp.Message, "Signature expired:") {
-			return fmt.Errorf("expected past date error message, instead got %v", errResp.Message)
+		if errResp.Code != "RequestTimeTooSkewed" {
+			return fmt.Errorf("expected error code to be %v, instead got %v", "RequestTimeTooSkewed", errResp.Code)
 		}
 
 		return nil
@@ -1657,7 +1671,21 @@ func CreateBucket_existing_bucket(s *S3Conf) error {
 	testName := "CreateBucket_existing_bucket"
 	runF(testName)
 	bucket := getBucketName()
-	err := setup(s, bucket)
+	admin := user{
+		access: "admin1",
+		secret: "admin1secret",
+		role:   "admin",
+	}
+	if err := createUsers(s, []user{admin}); err != nil {
+		failF("%v: %v", testName, err)
+		return fmt.Errorf("%v: %w", testName, err)
+	}
+
+	adminCfg := *s
+	adminCfg.awsID = admin.access
+	adminCfg.awsSecret = admin.secret
+
+	err := setup(&adminCfg, bucket)
 	if err != nil {
 		failF("%v: %v", testName, err)
 		return fmt.Errorf("%v: %w", testName, err)
@@ -1678,45 +1706,91 @@ func CreateBucket_existing_bucket(s *S3Conf) error {
 	return nil
 }
 
-func CreateBucket_default_acl(s *S3Conf) error {
-	testName := "CreateBucket_default_acl"
+func CreateBucket_owned_by_you(s *S3Conf) error {
+	testName := "CreateBucket_owned_by_you"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.CreateBucket(ctx, &s3.CreateBucketInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		var bErr *types.BucketAlreadyOwnedByYou
+		if !errors.As(err, &bErr) {
+			return fmt.Errorf("expected error to be %w, instead got %w", s3err.GetAPIError(s3err.ErrBucketAlreadyOwnedByYou), err)
+		}
+
+		return nil
+	})
+}
+
+func CreateBucket_invalid_ownership(s *S3Conf) error {
+	testName := "CreateBucket_invalid_ownership"
 	runF(testName)
 
-	bucket := getBucketName()
-	client := s3.NewFromConfig(s.Config())
-
-	err := setup(s, bucket)
-	if err != nil {
+	invalidOwnership := types.ObjectOwnership("invalid_ownership")
+	err := setup(s, getBucketName(), withOwnership(invalidOwnership))
+	if err := checkApiErr(err, s3err.APIError{
+		Code:           "InvalidArgument",
+		Description:    fmt.Sprintf("Invalid x-amz-object-ownership header: %v", invalidOwnership),
+		HTTPStatusCode: http.StatusBadRequest,
+	}); err != nil {
 		failF("%v: %v", testName, err)
-		return fmt.Errorf("%v: %w", testName, err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-	out, err := client.GetBucketAcl(ctx, &s3.GetBucketAclInput{Bucket: &bucket})
-	cancel()
-	if err != nil {
-		failF("%v: %v", testName, err)
-		return fmt.Errorf("%v: %w", testName, err)
-	}
-
-	if *out.Owner.ID != s.awsID {
-		failF("%v: expected bucket owner to be %v, instead got %v", testName, s.awsID, *out.Owner.ID)
-		return fmt.Errorf("%v: expected bucket owner to be %v, instead got %v", testName, s.awsID, *out.Owner.ID)
-	}
-
-	if len(out.Grants) != 0 {
-		failF("%v: expected grants to be empty instead got %v", testName, len(out.Grants))
-		return fmt.Errorf("%v: expected grants to be empty instead got %v", testName, len(out.Grants))
-	}
-
-	err = teardown(s, bucket)
-	if err != nil {
-		failF("%v: %v", err)
 		return fmt.Errorf("%v: %w", testName, err)
 	}
 
 	passF(testName)
 	return nil
+}
+
+func CreateBucket_ownership_with_acl(s *S3Conf) error {
+	testName := "CreateBucket_ownership_with_acl"
+
+	runF(testName)
+	client := s3.NewFromConfig(s.Config())
+
+	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+	_, err := client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket:          getPtr(getBucketName()),
+		ObjectOwnership: types.ObjectOwnershipBucketOwnerEnforced,
+		ACL:             types.BucketCannedACLPublicRead,
+	})
+	cancel()
+	if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidBucketAclWithObjectOwnership)); err != nil {
+		failF("%v: %v", testName, err)
+		return fmt.Errorf("%v: %w", testName, err)
+	}
+
+	passF(testName)
+	return nil
+}
+
+func CreateBucket_default_acl(s *S3Conf) error {
+	testName := "CreateBucket_default_acl"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.GetBucketAcl(ctx, &s3.GetBucketAclInput{Bucket: &bucket})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *out.Owner.ID != s.awsID {
+			return fmt.Errorf("expected bucket owner to be %v, instead got %v", s.awsID, *out.Owner.ID)
+		}
+		if len(out.Grants) != 1 {
+			return fmt.Errorf("expected grants length to be 1, instead got %v", len(out.Grants))
+		}
+		grt := out.Grants[0]
+		if grt.Permission != types.PermissionFullControl {
+			return fmt.Errorf("expected the grantee to have full-control permission, instead got %v", grt.Permission)
+		}
+		if *grt.Grantee.ID != s.awsID {
+			return fmt.Errorf("expected the grantee id to be %v, instead got %v", s.awsID, *grt.Grantee.ID)
+		}
+
+		return nil
+	})
 }
 
 func CreateBucket_non_default_acl(s *S3Conf) error {
@@ -1736,19 +1810,29 @@ func CreateBucket_non_default_acl(s *S3Conf) error {
 	grants := []types.Grant{
 		{
 			Grantee: &types.Grantee{
-				ID: getPtr("grt1"),
+				ID:   &s.awsID,
+				Type: types.TypeCanonicalUser,
 			},
 			Permission: types.PermissionFullControl,
 		},
 		{
 			Grantee: &types.Grantee{
-				ID: getPtr("grt2"),
+				ID:   getPtr("grt1"),
+				Type: types.TypeCanonicalUser,
+			},
+			Permission: types.PermissionFullControl,
+		},
+		{
+			Grantee: &types.Grantee{
+				ID:   getPtr("grt2"),
+				Type: types.TypeCanonicalUser,
 			},
 			Permission: types.PermissionReadAcp,
 		},
 		{
 			Grantee: &types.Grantee{
-				ID: getPtr("grt3"),
+				ID:   getPtr("grt3"),
+				Type: types.TypeCanonicalUser,
 			},
 			Permission: types.PermissionWrite,
 		},
@@ -1758,7 +1842,13 @@ func CreateBucket_non_default_acl(s *S3Conf) error {
 	client := s3.NewFromConfig(s.Config())
 
 	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-	_, err = client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: &bucket, GrantFullControl: getPtr("grt1"), GrantReadACP: getPtr("grt2"), GrantWrite: getPtr("grt3")})
+	_, err = client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket:           &bucket,
+		GrantFullControl: getPtr("grt1"),
+		GrantReadACP:     getPtr("grt2"),
+		GrantWrite:       getPtr("grt3"),
+		ObjectOwnership:  types.ObjectOwnershipBucketOwnerPreferred,
+	})
 	cancel()
 	if err != nil {
 		failF("%v: %v", err)
@@ -1776,6 +1866,51 @@ func CreateBucket_non_default_acl(s *S3Conf) error {
 	if !compareGrants(out.Grants, grants) {
 		failF("%v: expected bucket acl grants to be %v, instead got %v", testName, grants, out.Grants)
 		return fmt.Errorf("%v: expected bucket acl grants to be %v, instead got %v", testName, grants, out.Grants)
+	}
+
+	err = teardown(s, bucket)
+	if err != nil {
+		failF("%v: %v", err)
+		return fmt.Errorf("%v: %w", testName, err)
+	}
+
+	passF(testName)
+	return nil
+}
+
+func CreateBucket_default_object_lock(s *S3Conf) error {
+	testName := "CreateBucket_default_object_lock"
+	runF(testName)
+
+	bucket := getBucketName()
+	lockEnabled := true
+
+	client := s3.NewFromConfig(s.Config())
+
+	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+	_, err := client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket:                     &bucket,
+		ObjectLockEnabledForBucket: &lockEnabled,
+	})
+	cancel()
+	if err != nil {
+		failF("%v: %v", err)
+		return fmt.Errorf("%v: %w", testName, err)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+	resp, err := client.GetObjectLockConfiguration(ctx, &s3.GetObjectLockConfigurationInput{
+		Bucket: &bucket,
+	})
+	cancel()
+	if err != nil {
+		failF("%v: %v", err)
+		return fmt.Errorf("%v: %w", testName, err)
+	}
+
+	if resp.ObjectLockConfiguration.ObjectLockEnabled != types.ObjectLockEnabledEnabled {
+		failF("%v: expected object lock to be enabled", testName)
+		return fmt.Errorf("%v: expected object lock to be enabled", testName)
 	}
 
 	err = teardown(s, bucket)
@@ -1831,7 +1966,7 @@ func HeadBucket_success(s *S3Conf) error {
 func ListBuckets_as_user(s *S3Conf) error {
 	testName := "ListBuckets_as_user"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		buckets := []s3response.ListAllMyBucketsEntry{{Name: bucket}}
+		buckets := []types.Bucket{{Name: &bucket}}
 		for i := 0; i < 6; i++ {
 			bckt := getBucketName()
 
@@ -1840,8 +1975,8 @@ func ListBuckets_as_user(s *S3Conf) error {
 				return err
 			}
 
-			buckets = append(buckets, s3response.ListAllMyBucketsEntry{
-				Name: bckt,
+			buckets = append(buckets, types.Bucket{
+				Name: &bckt,
 			})
 		}
 		usr := user{
@@ -1861,7 +1996,7 @@ func ListBuckets_as_user(s *S3Conf) error {
 
 		bckts := []string{}
 		for i := 0; i < 3; i++ {
-			bckts = append(bckts, buckets[i].Name)
+			bckts = append(bckts, *buckets[i].Name)
 		}
 
 		err = changeBucketsOwner(s, bckts, usr.access)
@@ -1881,12 +2016,12 @@ func ListBuckets_as_user(s *S3Conf) error {
 		if *out.Owner.ID != usr.access {
 			return fmt.Errorf("expected buckets owner to be %v, instead got %v", usr.access, *out.Owner.ID)
 		}
-		if ok := compareBuckets(out.Buckets, buckets[:3]); !ok {
+		if !compareBuckets(out.Buckets, buckets[:3]) {
 			return fmt.Errorf("expected list buckets result to be %v, instead got %v", buckets[:3], out.Buckets)
 		}
 
 		for _, elem := range buckets[1:] {
-			err = teardown(s, elem.Name)
+			err = teardown(s, *elem.Name)
 			if err != nil {
 				return err
 			}
@@ -1899,7 +2034,7 @@ func ListBuckets_as_user(s *S3Conf) error {
 func ListBuckets_as_admin(s *S3Conf) error {
 	testName := "ListBuckets_as_admin"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		buckets := []s3response.ListAllMyBucketsEntry{{Name: bucket}}
+		buckets := []types.Bucket{{Name: &bucket}}
 		for i := 0; i < 6; i++ {
 			bckt := getBucketName()
 
@@ -1908,8 +2043,8 @@ func ListBuckets_as_admin(s *S3Conf) error {
 				return err
 			}
 
-			buckets = append(buckets, s3response.ListAllMyBucketsEntry{
-				Name: bckt,
+			buckets = append(buckets, types.Bucket{
+				Name: &bckt,
 			})
 		}
 		usr := user{
@@ -1934,7 +2069,7 @@ func ListBuckets_as_admin(s *S3Conf) error {
 
 		bckts := []string{}
 		for i := 0; i < 3; i++ {
-			bckts = append(bckts, buckets[i].Name)
+			bckts = append(bckts, *buckets[i].Name)
 		}
 
 		err = changeBucketsOwner(s, bckts, usr.access)
@@ -1954,12 +2089,12 @@ func ListBuckets_as_admin(s *S3Conf) error {
 		if *out.Owner.ID != admin.access {
 			return fmt.Errorf("expected buckets owner to be %v, instead got %v", admin.access, *out.Owner.ID)
 		}
-		if ok := compareBuckets(out.Buckets, buckets); !ok {
+		if !compareBuckets(out.Buckets, buckets) {
 			return fmt.Errorf("expected list buckets result to be %v, instead got %v", buckets, out.Buckets)
 		}
 
 		for _, elem := range buckets[1:] {
-			err = teardown(s, elem.Name)
+			err = teardown(s, *elem.Name)
 			if err != nil {
 				return err
 			}
@@ -1969,10 +2104,95 @@ func ListBuckets_as_admin(s *S3Conf) error {
 	})
 }
 
-func ListBuckets_success(s *S3Conf) error {
-	testName := "ListBuckets_success"
+func ListBuckets_with_prefix(s *S3Conf) error {
+	testName := "ListBuckets_with_prefix"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		buckets := []s3response.ListAllMyBucketsEntry{{Name: bucket}}
+		prefix := "my-prefix-"
+		allBuckets, prefixedBuckets := []types.Bucket{{Name: &bucket}}, []types.Bucket{}
+		for i := 0; i < 5; i++ {
+			bckt := getBucketName()
+			if i%2 == 0 {
+				bckt = prefix + bckt
+			}
+
+			err := setup(s, bckt)
+			if err != nil {
+				return err
+			}
+
+			allBuckets = append(allBuckets, types.Bucket{
+				Name: &bckt,
+			})
+
+			if i%2 == 0 {
+				prefixedBuckets = append(prefixedBuckets, types.Bucket{
+					Name: &bckt,
+				})
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.ListBuckets(ctx, &s3.ListBucketsInput{
+			Prefix: &prefix,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *out.Owner.ID != s.awsID {
+			return fmt.Errorf("expected owner to be %v, instead got %v", s.awsID, *out.Owner.ID)
+		}
+		if getString(out.Prefix) != prefix {
+			return fmt.Errorf("expected prefix to be %v, instead got %v", prefix, getString(out.Prefix))
+		}
+		if !compareBuckets(out.Buckets, prefixedBuckets) {
+			return fmt.Errorf("expected list buckets result to be %v, instead got %v", prefixedBuckets, out.Buckets)
+		}
+
+		for _, elem := range allBuckets[1:] {
+			err = teardown(s, *elem.Name)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+}
+
+func ListBuckets_invalid_max_buckets(s *S3Conf) error {
+	testName := "ListBuckets_invalid_max_buckets"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		listBuckets := func(maxBuckets int32) error {
+			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+			_, err := s3client.ListBuckets(ctx, &s3.ListBucketsInput{
+				MaxBuckets: &maxBuckets,
+			})
+			cancel()
+			return err
+		}
+
+		invMaxBuckets := int32(-3)
+		err := listBuckets(invMaxBuckets)
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidMaxBuckets)); err != nil {
+			return err
+		}
+
+		invMaxBuckets = 2000000
+		err = listBuckets(invMaxBuckets)
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidMaxBuckets)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func ListBuckets_truncated(s *S3Conf) error {
+	testName := "ListBuckets_truncated"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		buckets := []types.Bucket{{Name: &bucket}}
 		for i := 0; i < 5; i++ {
 			bckt := getBucketName()
 
@@ -1981,8 +2201,93 @@ func ListBuckets_success(s *S3Conf) error {
 				return err
 			}
 
-			buckets = append(buckets, s3response.ListAllMyBucketsEntry{
-				Name: bckt,
+			buckets = append(buckets, types.Bucket{
+				Name: &bckt,
+			})
+		}
+
+		maxBuckets := int32(3)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.ListBuckets(ctx, &s3.ListBucketsInput{
+			MaxBuckets: &maxBuckets,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *out.Owner.ID != s.awsID {
+			return fmt.Errorf("expected owner to be %v, instead got %v", s.awsID, *out.Owner.ID)
+		}
+		if !compareBuckets(out.Buckets, buckets[:maxBuckets]) {
+			return fmt.Errorf("expected list buckets result to be %v, instead got %v", buckets[:maxBuckets], out.Buckets)
+		}
+		if getString(out.ContinuationToken) != *buckets[maxBuckets-1].Name {
+			return fmt.Errorf("expected ContinuationToken to be %v, instead got %v", *buckets[maxBuckets-1].Name, getString(out.ContinuationToken))
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		out, err = s3client.ListBuckets(ctx, &s3.ListBucketsInput{
+			ContinuationToken: out.ContinuationToken,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !compareBuckets(out.Buckets, buckets[maxBuckets:]) {
+			return fmt.Errorf("expected list buckets result to be %v, instead got %v", buckets[maxBuckets:], out.Buckets)
+		}
+		if out.ContinuationToken != nil {
+			return fmt.Errorf("expected nil continuation token, instead got %v", *out.ContinuationToken)
+		}
+		if out.Prefix != nil {
+			return fmt.Errorf("expected nil prefix, instead got %v", *out.Prefix)
+		}
+
+		for _, elem := range buckets[1:] {
+			err = teardown(s, *elem.Name)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+}
+
+func ListBuckets_empty_success(s *S3Conf) error {
+	testName := "ListBuckets_empty_success"
+	return actionHandlerNoSetup(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.ListBuckets(ctx, &s3.ListBucketsInput{})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if len(out.Buckets) > 0 {
+			return fmt.Errorf("expected list buckets result to be %v, instead got %v", []types.Bucket{}, out.Buckets)
+		}
+
+		return nil
+	})
+}
+
+func ListBuckets_success(s *S3Conf) error {
+	testName := "ListBuckets_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		buckets := []types.Bucket{{Name: &bucket}}
+		for i := 0; i < 5; i++ {
+			bckt := getBucketName()
+
+			err := setup(s, bckt)
+			if err != nil {
+				return err
+			}
+
+			buckets = append(buckets, types.Bucket{
+				Name: &bckt,
 			})
 		}
 
@@ -1996,12 +2301,12 @@ func ListBuckets_success(s *S3Conf) error {
 		if *out.Owner.ID != s.awsID {
 			return fmt.Errorf("expected owner to be %v, instead got %v", s.awsID, *out.Owner.ID)
 		}
-		if ok := compareBuckets(out.Buckets, buckets); !ok {
+		if !compareBuckets(out.Buckets, buckets) {
 			return fmt.Errorf("expected list buckets result to be %v, instead got %v", buckets, out.Buckets)
 		}
 
 		for _, elem := range buckets[1:] {
-			err = teardown(s, elem.Name)
+			err = teardown(s, *elem.Name)
 			if err != nil {
 				return err
 			}
@@ -2055,7 +2360,7 @@ func DeleteBucket_non_existing_bucket(s *S3Conf) error {
 func DeleteBucket_non_empty_bucket(s *S3Conf) error {
 	testName := "DeleteBucket_non_empty_bucket"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		err := putObjects(s3client, []string{"foo"}, bucket)
+		_, err := putObjects(s3client, []string{"foo"}, bucket)
 		if err != nil {
 			return err
 		}
@@ -2083,7 +2388,7 @@ func DeleteBucket_success_status_code(s *S3Conf) error {
 		return fmt.Errorf("%v: %w", testName, err)
 	}
 
-	req, err := createSignedReq(http.MethodDelete, s.endpoint, bucket, s.awsID, s.awsSecret, "s3", s.awsRegion, nil, time.Now())
+	req, err := createSignedReq(http.MethodDelete, s.endpoint, bucket, s.awsID, s.awsSecret, "s3", s.awsRegion, nil, time.Now(), nil)
 	if err != nil {
 		failF("%v: %v", testName, err)
 		return fmt.Errorf("%v: %w", testName, err)
@@ -2106,6 +2411,220 @@ func DeleteBucket_success_status_code(s *S3Conf) error {
 
 	passF(testName)
 	return nil
+}
+
+func PutBucketOwnershipControls_non_existing_bucket(s *S3Conf) error {
+	testName := "PutBucketOwnershipControls_non_existing_bucket"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketOwnershipControls(ctx, &s3.PutBucketOwnershipControlsInput{
+			Bucket: getPtr(getBucketName()),
+			OwnershipControls: &types.OwnershipControls{
+				Rules: []types.OwnershipControlsRule{
+					{
+						ObjectOwnership: types.ObjectOwnershipBucketOwnerPreferred,
+					},
+				},
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchBucket)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func PutBucketOwnershipControls_multiple_rules(s *S3Conf) error {
+	testName := "PutBucketOwnershipControls_multiple_rules"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketOwnershipControls(ctx, &s3.PutBucketOwnershipControlsInput{
+			Bucket: &bucket,
+			OwnershipControls: &types.OwnershipControls{
+				Rules: []types.OwnershipControlsRule{
+					{
+						ObjectOwnership: types.ObjectOwnershipBucketOwnerPreferred,
+					},
+					{
+						ObjectOwnership: types.ObjectOwnershipObjectWriter,
+					},
+				},
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMalformedXML)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func PutBucketOwnershipControls_invalid_ownership(s *S3Conf) error {
+	testName := "PutBucketOwnershipControls_invalid_ownership"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketOwnershipControls(ctx, &s3.PutBucketOwnershipControlsInput{
+			Bucket: &bucket,
+			OwnershipControls: &types.OwnershipControls{
+				Rules: []types.OwnershipControlsRule{
+					{
+						ObjectOwnership: types.ObjectOwnership("invalid_ownership"),
+					},
+				},
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMalformedXML)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func PutBucketOwnershipControls_success(s *S3Conf) error {
+	testName := "PutBucketOwnershipControls_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketOwnershipControls(ctx, &s3.PutBucketOwnershipControlsInput{
+			Bucket: &bucket,
+			OwnershipControls: &types.OwnershipControls{
+				Rules: []types.OwnershipControlsRule{
+					{
+						ObjectOwnership: types.ObjectOwnershipObjectWriter,
+					},
+				},
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func GetBucketOwnershipControls_non_existing_bucket(s *S3Conf) error {
+	testName := "GetBucketOwnershipControls_non_existing_bucket"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.GetBucketOwnershipControls(ctx, &s3.GetBucketOwnershipControlsInput{
+			Bucket: getPtr(getBucketName()),
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchBucket)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func GetBucketOwnershipControls_default_ownership(s *S3Conf) error {
+	testName := "GetBucketOwnershipControls_default_ownership"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		resp, err := s3client.GetBucketOwnershipControls(ctx, &s3.GetBucketOwnershipControlsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if len(resp.OwnershipControls.Rules) != 1 {
+			return fmt.Errorf("expected ownership control rules length to be 1, instead got %v", len(resp.OwnershipControls.Rules))
+		}
+		if resp.OwnershipControls.Rules[0].ObjectOwnership != types.ObjectOwnershipBucketOwnerEnforced {
+			return fmt.Errorf("expected the bucket ownership to be %v, instead got %v", types.ObjectOwnershipBucketOwnerEnforced, resp.OwnershipControls.Rules[0].ObjectOwnership)
+		}
+
+		return nil
+	})
+}
+
+func GetBucketOwnershipControls_success(s *S3Conf) error {
+	testName := "GetBucketOwnershipControls_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketOwnershipControls(ctx, &s3.PutBucketOwnershipControlsInput{
+			Bucket: &bucket,
+			OwnershipControls: &types.OwnershipControls{
+				Rules: []types.OwnershipControlsRule{
+					{
+						ObjectOwnership: types.ObjectOwnershipObjectWriter,
+					},
+				},
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		resp, err := s3client.GetBucketOwnershipControls(ctx, &s3.GetBucketOwnershipControlsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if len(resp.OwnershipControls.Rules) != 1 {
+			return fmt.Errorf("expected ownership control rules length to be 1, instead got %v", len(resp.OwnershipControls.Rules))
+		}
+		if resp.OwnershipControls.Rules[0].ObjectOwnership != types.ObjectOwnershipObjectWriter {
+			return fmt.Errorf("expected the bucket ownership to be %v, instead got %v", types.ObjectOwnershipObjectWriter, resp.OwnershipControls.Rules[0].ObjectOwnership)
+		}
+
+		return nil
+	})
+}
+
+func DeleteBucketOwnershipControls_non_existing_bucket(s *S3Conf) error {
+	testName := "DeleteBucketOwnershipControls_non_existing_bucket"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.DeleteBucketOwnershipControls(ctx, &s3.DeleteBucketOwnershipControlsInput{
+			Bucket: getPtr(getBucketName()),
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchBucket)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func DeleteBucketOwnershipControls_success(s *S3Conf) error {
+	testName := "DeleteBucketOwnershipControls_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.DeleteBucketOwnershipControls(ctx, &s3.DeleteBucketOwnershipControlsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetBucketOwnershipControls(ctx, &s3.GetBucketOwnershipControlsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrOwnershipControlsNotFound)); err != nil {
+			return err
+		}
+
+		return nil
+	})
 }
 
 func PutBucketTagging_non_existing_bucket(s *S3Conf) error {
@@ -2172,6 +2691,45 @@ func PutBucketTagging_success(s *S3Conf) error {
 	})
 }
 
+func PutBucketTagging_success_status(s *S3Conf) error {
+	testName := "PutBucketTagging_success_status"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		tagging := types.Tagging{
+			TagSet: []types.Tag{
+				{
+					Key:   getPtr("key"),
+					Value: getPtr("val"),
+				},
+			},
+		}
+
+		taggingParsed, err := xml.Marshal(tagging)
+		if err != nil {
+			return fmt.Errorf("err parsing tagging: %w", err)
+		}
+
+		req, err := createSignedReq(http.MethodPut, s.endpoint, fmt.Sprintf("%v?tagging=", bucket), s.awsID, s.awsSecret, "s3", s.awsRegion, taggingParsed, time.Now(), nil)
+		if err != nil {
+			return fmt.Errorf("err signing the request: %w", err)
+		}
+
+		client := http.Client{
+			Timeout: shortTimeout,
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("err sending request: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusNoContent {
+			return fmt.Errorf("expected the response status code to be %v, instad got %v", http.StatusNoContent, resp.StatusCode)
+		}
+
+		return nil
+	})
+}
+
 func GetBucketTagging_non_existing_bucket(s *S3Conf) error {
 	testName := "GetBucketTagging_non_existing_object"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
@@ -2181,6 +2739,21 @@ func GetBucketTagging_non_existing_bucket(s *S3Conf) error {
 		})
 		cancel()
 		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchBucket)); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func GetBucketTagging_unset_tags(s *S3Conf) error {
+	testName := "GetBucketTagging_unset_tags"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.GetBucketTagging(ctx, &s3.GetBucketTaggingInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrBucketTaggingNotFound)); err != nil {
 			return err
 		}
 		return nil
@@ -2255,7 +2828,7 @@ func DeleteBucketTagging_success_status(s *S3Conf) error {
 			return err
 		}
 
-		req, err := createSignedReq(http.MethodDelete, s.endpoint, fmt.Sprintf("%v?tagging", bucket), s.awsID, s.awsSecret, "s3", s.awsRegion, nil, time.Now())
+		req, err := createSignedReq(http.MethodDelete, s.endpoint, fmt.Sprintf("%v?tagging", bucket), s.awsID, s.awsSecret, "s3", s.awsRegion, nil, time.Now(), nil)
 		if err != nil {
 			return err
 		}
@@ -2320,7 +2893,7 @@ func DeleteBucketTagging_success(s *S3Conf) error {
 func PutObject_non_existing_bucket(s *S3Conf) error {
 	testName := "PutObject_non_existing_bucket"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		err := putObjects(s3client, []string{"my-obj"}, "non-existing-bucket")
+		_, err := putObjects(s3client, []string{"my-obj"}, "non-existing-bucket")
 		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchBucket)); err != nil {
 			return err
 		}
@@ -2330,11 +2903,38 @@ func PutObject_non_existing_bucket(s *S3Conf) error {
 
 func PutObject_special_chars(s *S3Conf) error {
 	testName := "PutObject_special_chars"
+
+	objnames := []string{
+		"my!key", "my-key", "my_key", "my.key", "my'key", "my(key", "my)key",
+		"my&key", "my@key", "my=key", "my;key", "my:key", "my key", "my,key",
+		"my?key", "my^key", "my{}key", "my%key", "my`key",
+		"my[]key", "my~key", "my<>key", "my|key", "my#key",
+	}
+	if !s.azureTests {
+		// azure currently can't handle backslashes in object names
+		objnames = append(objnames, "my\\key")
+	}
+
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		err := putObjects(s3client, []string{"my%key", "my^key", "my*key", "my.key", "my-key", "my_key", "my!key", "my'key", "my(key", "my)key", "my\\key", "my{}key", "my[]key", "my`key", "my+key", "my%25key", "my@key"}, bucket)
+		objs, err := putObjects(s3client, objnames, bucket)
 		if err != nil {
 			return err
 		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !compareObjects(res.Contents, objs) {
+			return fmt.Errorf("expected the objects to be %v, instead got %v",
+				objStrings(objs), objStrings(res.Contents))
+		}
+
 		return nil
 	})
 }
@@ -2352,7 +2952,6 @@ func PutObject_invalid_long_tags(s *S3Conf) error {
 			Tagging: &tagging,
 		})
 		cancel()
-
 		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidTag)); err != nil {
 			return err
 		}
@@ -2375,10 +2974,158 @@ func PutObject_invalid_long_tags(s *S3Conf) error {
 	})
 }
 
+func PutObject_missing_object_lock_retention_config(s *S3Conf) error {
+	testName := "PutObject_missing_object_lock_retention_config"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		key := "my-obj"
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:         &bucket,
+			Key:            &key,
+			ObjectLockMode: types.ObjectLockModeCompliance,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLockInvalidHeaders)); err != nil {
+			return err
+		}
+
+		retainDate := time.Now().Add(time.Hour * 48)
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:                    &bucket,
+			Key:                       &key,
+			ObjectLockRetainUntilDate: &retainDate,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLockInvalidHeaders)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func PutObject_with_object_lock(s *S3Conf) error {
+	testName := "PutObject_with_object_lock"
+	runF(testName)
+	bucket, obj, lockStatus := getBucketName(), "my-obj", true
+
+	client := s3.NewFromConfig(s.Config())
+	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+	_, err := client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket:                     &bucket,
+		ObjectLockEnabledForBucket: &lockStatus,
+	})
+	cancel()
+	if err != nil {
+		failF("%v: %v", testName, err)
+		return fmt.Errorf("%v: %w", testName, err)
+	}
+
+	retainDate := time.Now().Add(time.Hour * 48)
+
+	ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:                    &bucket,
+		Key:                       &obj,
+		ObjectLockLegalHoldStatus: types.ObjectLockLegalHoldStatusOn,
+		ObjectLockMode:            types.ObjectLockModeCompliance,
+		ObjectLockRetainUntilDate: &retainDate,
+	})
+
+	cancel()
+	if err != nil {
+		failF("%v: %v", testName, err)
+		return fmt.Errorf("%v: %w", testName, err)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+	out, err := client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: &bucket,
+		Key:    &obj,
+	})
+	cancel()
+	if err != nil {
+		failF("%v: %v", testName, err)
+		return fmt.Errorf("%v: %w", testName, err)
+	}
+
+	if out.ObjectLockMode != types.ObjectLockModeCompliance {
+		failF("%v: expected object lock mode to be %v, instead got %v", testName, types.ObjectLockModeCompliance, out.ObjectLockMode)
+		return fmt.Errorf("%v: expected object lock mode to be %v, instead got %v", testName, types.ObjectLockModeCompliance, out.ObjectLockMode)
+	}
+	if out.ObjectLockLegalHoldStatus != types.ObjectLockLegalHoldStatusOn {
+		failF("%v: expected object lock mode to be %v, instead got %v", testName, types.ObjectLockLegalHoldStatusOn, out.ObjectLockLegalHoldStatus)
+		return fmt.Errorf("%v: expected object lock mode to be %v, instead got %v", testName, types.ObjectLockLegalHoldStatusOn, out.ObjectLockLegalHoldStatus)
+	}
+
+	if err := changeBucketObjectLockStatus(client, bucket, false); err != nil {
+		failF("%v: %v", err)
+		return fmt.Errorf("%v: %w", testName, err)
+	}
+
+	err = teardown(s, bucket)
+	if err != nil {
+		failF("%v: %v", err)
+		return fmt.Errorf("%v: %w", testName, err)
+	}
+
+	passF(testName)
+	return nil
+}
+
+func PutObject_racey_success(s *S3Conf) error {
+	testName := "PutObject_racey_success"
+	runF(testName)
+	bucket, obj, lockStatus := getBucketName(), "my-obj", true
+
+	client := s3.NewFromConfig(s.Config())
+	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+	_, err := client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket:                     &bucket,
+		ObjectLockEnabledForBucket: &lockStatus,
+	})
+	cancel()
+	if err != nil {
+		failF("%v: %v", testName, err)
+		return fmt.Errorf("%v: %w", testName, err)
+	}
+
+	eg := errgroup.Group{}
+	for i := 0; i < 10; i++ {
+		eg.Go(func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+			_, err := client.PutObject(ctx, &s3.PutObjectInput{
+				Bucket: &bucket,
+				Key:    &obj,
+			})
+			cancel()
+			return err
+		})
+	}
+	err = eg.Wait()
+
+	if err != nil {
+		failF("%v: %v", testName, err)
+		return fmt.Errorf("%v: %w", testName, err)
+	}
+
+	err = teardown(s, bucket)
+	if err != nil {
+		failF("%v: %v", err)
+		return fmt.Errorf("%v: %w", testName, err)
+	}
+
+	passF(testName)
+	return nil
+}
+
 func PutObject_success(s *S3Conf) error {
 	testName := "PutObject_success"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		err := putObjects(s3client, []string{"my-obj"}, bucket)
+		_, err := putObjects(s3client, []string{"my-obj"}, bucket)
 		if err != nil {
 			return err
 		}
@@ -2392,7 +3139,7 @@ func PutObject_invalid_credentials(s *S3Conf) error {
 		newconf := *s
 		newconf.awsSecret = newconf.awsSecret + "badpassword"
 		client := s3.NewFromConfig(newconf.Config())
-		err := putObjects(client, []string{"my-obj"}, bucket)
+		_, err := putObjects(client, []string{"my-obj"}, bucket)
 		return checkApiErr(err, s3err.GetAPIError(s3err.ErrSignatureDoesNotMatch))
 	})
 }
@@ -2413,6 +3160,233 @@ func HeadObject_non_existing_object(s *S3Conf) error {
 	})
 }
 
+func HeadObject_invalid_part_number(s *S3Conf) error {
+	testName := "HeadObject_invalid_part_number"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		partNumber := int32(-3)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket:     &bucket,
+			Key:        getPtr("my-obj"),
+			PartNumber: &partNumber,
+		})
+		cancel()
+		if err := checkSdkApiErr(err, "BadRequest"); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func HeadObject_non_existing_mp(s *S3Conf) error {
+	testName := "HeadObject_non_existing_mp"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		partNumber := int32(4)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket:     &bucket,
+			Key:        getPtr("my-obj"),
+			PartNumber: &partNumber,
+		})
+		cancel()
+		if err := checkSdkApiErr(err, "NotFound"); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func HeadObject_mp_success(s *S3Conf) error {
+	testName := "HeadObject_mp_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		partCount, partSize := int64(5), int64(1024)
+		partNumber := int32(3)
+
+		mp, err := createMp(s3client, bucket, obj)
+		if err != nil {
+			return err
+		}
+
+		parts, _, err := uploadParts(s3client, partCount*partSize, partCount, bucket, obj, *mp.UploadId)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket:     &bucket,
+			Key:        &obj,
+			PartNumber: &partNumber,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *out.ContentLength != int64(partSize) {
+			return fmt.Errorf("expected content length to be %v, instead got %v", partSize, *out.ContentLength)
+		}
+		if *out.ETag != *parts[partNumber-1].ETag {
+			return fmt.Errorf("expected ETag to be %v, instead got %v", *parts[partNumber-1].ETag, *out.ETag)
+		}
+		if *out.PartsCount != int32(partCount) {
+			return fmt.Errorf("expected part count to be %v, instead got %v", partCount, *out.PartsCount)
+		}
+		if out.StorageClass != types.StorageClassStandard {
+			return fmt.Errorf("expected the storage class to be %v, instead got %v", types.StorageClassStandard, out.StorageClass)
+		}
+
+		return nil
+	})
+}
+
+func HeadObject_non_existing_dir_object(s *S3Conf) error {
+	testName := "HeadObject_non_existing_dir_object"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj, dataLen := "my-obj", int64(1234567)
+		meta := map[string]string{
+			"key1": "val1",
+			"key2": "val2",
+		}
+
+		_, err := putObjectWithData(dataLen, &s3.PutObjectInput{
+			Bucket:   &bucket,
+			Key:      &obj,
+			Metadata: meta,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		obj = "my-obj/"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		defer cancel()
+		if err := checkSdkApiErr(err, "NotFound"); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func HeadObject_directory_object_noslash(s *S3Conf) error {
+	testName := "HeadObject_directory_object_noslash"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj/"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		obj = "my-obj"
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err := checkSdkApiErr(err, "NotFound"); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+const defaultContentType = "binary/octet-stream"
+
+func HeadObject_with_contenttype(s *S3Conf) error {
+	testName := "HeadObject_with_contenttype"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj, dataLen := "my-obj", int64(1234567)
+		contentType := "text/plain"
+		contentEncoding := "gzip"
+
+		_, err := putObjectWithData(dataLen, &s3.PutObjectInput{
+			Bucket:          &bucket,
+			Key:             &obj,
+			ContentType:     &contentType,
+			ContentEncoding: &contentEncoding,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		defer cancel()
+		if err != nil {
+			return err
+		}
+
+		contentLength := int64(0)
+		if out.ContentLength != nil {
+			contentLength = *out.ContentLength
+		}
+		if contentLength != dataLen {
+			return fmt.Errorf("expected data length %v, instead got %v", dataLen, contentLength)
+		}
+		if out.ContentType == nil {
+			return fmt.Errorf("expected content type %v, instead got nil", contentType)
+		}
+		if *out.ContentType != contentType {
+			return fmt.Errorf("expected content type %v, instead got %v", contentType, *out.ContentType)
+		}
+		if out.ContentEncoding == nil {
+			return fmt.Errorf("expected content encoding %v, instead got nil", contentEncoding)
+		}
+		if *out.ContentEncoding != contentEncoding {
+			return fmt.Errorf("expected content encoding %v, instead got %v", contentEncoding, *out.ContentEncoding)
+		}
+		if out.StorageClass != types.StorageClassStandard {
+			return fmt.Errorf("expected the storage class to be %v, instead got %v", types.StorageClassStandard, out.StorageClass)
+		}
+
+		return nil
+	})
+}
+
+func HeadObject_invalid_parent_dir(s *S3Conf) error {
+	testName := "HeadObject_invalid_parent_dir"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj, dataLen := "not-a-dir", int64(1)
+
+		_, err := putObjectWithData(dataLen, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		obj = "not-a-dir/bad-obj"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		defer cancel()
+		if err := checkSdkApiErr(err, "NotFound"); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
 func HeadObject_success(s *S3Conf) error {
 	testName := "HeadObject_success"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
@@ -2421,8 +3395,14 @@ func HeadObject_success(s *S3Conf) error {
 			"key1": "val1",
 			"key2": "val2",
 		}
+		ctype := defaultContentType
 
-		_, _, err := putObjectWithData(dataLen, &s3.PutObjectInput{Bucket: &bucket, Key: &obj, Metadata: meta}, s3client)
+		_, err := putObjectWithData(dataLen, &s3.PutObjectInput{
+			Bucket:      &bucket,
+			Key:         &obj,
+			Metadata:    meta,
+			ContentType: &ctype,
+		}, s3client)
 		if err != nil {
 			return err
 		}
@@ -2447,6 +3427,192 @@ func HeadObject_success(s *S3Conf) error {
 		if contentLength != dataLen {
 			return fmt.Errorf("expected data length %v, instead got %v", dataLen, contentLength)
 		}
+		if *out.ContentType != defaultContentType {
+			return fmt.Errorf("expected content type %v, instead got %v", defaultContentType, *out.ContentType)
+		}
+		if out.StorageClass != types.StorageClassStandard {
+			return fmt.Errorf("expected the storage class to be %v, instead got %v", types.StorageClassStandard, out.StorageClass)
+		}
+
+		return nil
+	})
+}
+
+func GetObjectAttributes_non_existing_bucket(s *S3Conf) error {
+	testName := "GetObjectAttributes_non_existing_bucket"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+			Bucket:           getPtr(getBucketName()),
+			Key:              getPtr("my-obj"),
+			ObjectAttributes: []types.ObjectAttributes{},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchBucket)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func GetObjectAttributes_non_existing_object(s *S3Conf) error {
+	testName := "GetObjectAttributes_non_existing_object"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+			Bucket: &bucket,
+			Key:    getPtr("my-obj"),
+			ObjectAttributes: []types.ObjectAttributes{
+				types.ObjectAttributesEtag,
+			},
+		})
+		cancel()
+		if err := checkSdkApiErr(err, "NoSuchKey"); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func GetObjectAttributes_invalid_attrs(s *S3Conf) error {
+	testName := "GetObjectAttributes_invalid_attrs"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := putObjects(s3client, []string{obj}, bucket)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+			Bucket: &bucket,
+			Key:    &obj,
+			ObjectAttributes: []types.ObjectAttributes{
+				types.ObjectAttributesEtag,
+				types.ObjectAttributes("Invalid_argument"),
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidObjectAttributes)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func GetObjectAttributes_invalid_parent(s *S3Conf) error {
+	testName := "GetObjectAttributes_invalid_parent"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "not-a-dir"
+		_, err := putObjects(s3client, []string{obj}, bucket)
+		if err != nil {
+			return err
+		}
+
+		obj = "not-a-dir/bad-obj"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+			Bucket: &bucket,
+			Key:    &obj,
+			ObjectAttributes: []types.ObjectAttributes{
+				types.ObjectAttributesEtag,
+			},
+		})
+		cancel()
+		var bae *types.NoSuchKey
+		if !errors.As(err, &bae) {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func GetObjectAttributes_empty_attrs(s *S3Conf) error {
+	testName := "GetObjectAttributes_empty_attrs"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := putObjects(s3client, []string{obj}, bucket)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+			Bucket:           &bucket,
+			Key:              &obj,
+			ObjectAttributes: []types.ObjectAttributes{},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectAttributesInvalidHeader)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func GetObjectAttributes_existing_object(s *S3Conf) error {
+	testName := "GetObjectAttributes_existing_object"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj, data_len := "my-obj", int64(45679)
+		data := make([]byte, data_len)
+
+		_, err := rand.Read(data)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		resp, err := s3client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+			Body:   bytes.NewReader(data),
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+			Bucket: &bucket,
+			Key:    &obj,
+			ObjectAttributes: []types.ObjectAttributes{
+				types.ObjectAttributesEtag,
+				types.ObjectAttributesObjectSize,
+				types.ObjectAttributesStorageClass,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if resp.ETag == nil || out.ETag == nil {
+			return fmt.Errorf("nil ETag output")
+		}
+		if *resp.ETag != *out.ETag {
+			return fmt.Errorf("expected ETag to be %v, instead got %v", *resp.ETag, *out.ETag)
+		}
+		if out.ObjectSize == nil {
+			return fmt.Errorf("nil object size output")
+		}
+		if *out.ObjectSize != data_len {
+			return fmt.Errorf("expected object size to be %v, instead got %v", data_len, *out.ObjectSize)
+		}
+		if out.Checksum != nil {
+			return fmt.Errorf("expected checksum to be nil, instead got %v", *out.Checksum)
+		}
+		if out.StorageClass != types.StorageClassStandard {
+			return fmt.Errorf("expected the storage class to be %v, instead got %v", types.StorageClassStandard, out.StorageClass)
+		}
+		if out.LastModified == nil {
+			return fmt.Errorf("expected non nil LastModified")
+		}
 
 		return nil
 	})
@@ -2469,12 +3635,41 @@ func GetObject_non_existing_key(s *S3Conf) error {
 	})
 }
 
+func GetObject_directory_object_noslash(s *S3Conf) error {
+	testName := "GetObject_directory_object_noslash"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj/"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		obj = "my-obj"
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		var bae *types.NoSuchKey
+		if !errors.As(err, &bae) {
+			return err
+		}
+		return nil
+	})
+}
+
 func GetObject_invalid_ranges(s *S3Conf) error {
 	testName := "GetObject_invalid_ranges"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		dataLength, obj := int64(1234567), "my-obj"
 
-		_, _, err := putObjectWithData(dataLength, &s3.PutObjectInput{
+		_, err := putObjectWithData(dataLength, &s3.PutObjectInput{
 			Bucket: &bucket,
 			Key:    &obj,
 		}, s3client)
@@ -2505,13 +3700,44 @@ func GetObject_invalid_ranges(s *S3Conf) error {
 		}
 
 		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
-		_, err = s3client.GetObject(ctx, &s3.GetObjectInput{
+		resp, err := s3client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: &bucket,
 			Key:    &obj,
-			Range:  getPtr("bytes=1000000000-999999999999"),
+			Range:  getPtr("bytes=1500-999999999999"),
 		})
 		cancel()
-		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidRange)); err != nil {
+		if err != nil {
+			return err
+		}
+
+		if *resp.ContentLength != dataLength-1500 {
+			return fmt.Errorf("expected content-length to be %v, instead got %v", dataLength-1500, *resp.ContentLength)
+		}
+		return nil
+	})
+}
+
+func GetObject_invalid_parent(s *S3Conf) error {
+	testName := "GetObject_invalid_parent"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dataLength, obj := int64(1234567), "not-a-dir"
+
+		_, err := putObjectWithData(dataLength, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: &bucket,
+			Key:    getPtr("not-a-dir/bad-obj"),
+		})
+		cancel()
+		var bae *types.NoSuchKey
+		if !errors.As(err, &bae) {
 			return err
 		}
 		return nil
@@ -2527,7 +3753,7 @@ func GetObject_with_meta(s *S3Conf) error {
 			"key2": "val2",
 		}
 
-		_, _, err := putObjectWithData(0, &s3.PutObjectInput{Bucket: &bucket, Key: &obj, Metadata: meta}, s3client)
+		_, err := putObjectWithData(0, &s3.PutObjectInput{Bucket: &bucket, Key: &obj, Metadata: meta}, s3client)
 		if err != nil {
 			return err
 		}
@@ -2554,8 +3780,57 @@ func GetObject_success(s *S3Conf) error {
 	testName := "GetObject_success"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		dataLength, obj := int64(1234567), "my-obj"
+		ctype := defaultContentType
 
-		csum, _, err := putObjectWithData(dataLength, &s3.PutObjectInput{
+		r, err := putObjectWithData(dataLength, &s3.PutObjectInput{
+			Bucket:      &bucket,
+			Key:         &obj,
+			ContentType: &ctype,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		defer cancel()
+		if err != nil {
+			return err
+		}
+		if *out.ContentLength != dataLength {
+			return fmt.Errorf("expected content-length %v, instead got %v", dataLength, out.ContentLength)
+		}
+		if *out.ContentType != defaultContentType {
+			return fmt.Errorf("expected content type %v, instead got %v", defaultContentType, *out.ContentType)
+		}
+		if out.StorageClass != types.StorageClassStandard {
+			return fmt.Errorf("expected the storage class to be %v, instead got %v", types.StorageClassStandard, out.StorageClass)
+		}
+
+		bdy, err := io.ReadAll(out.Body)
+		if err != nil {
+			return err
+		}
+		defer out.Body.Close()
+		outCsum := sha256.Sum256(bdy)
+		if outCsum != r.csum {
+			return fmt.Errorf("invalid object data")
+		}
+		return nil
+	})
+}
+
+const directoryContentType = "application/x-directory"
+
+func GetObject_directory_success(s *S3Conf) error {
+	testName := "GetObject_directory_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dataLength, obj := int64(0), "my-dir/"
+
+		_, err := putObjectWithData(dataLength, &s3.PutObjectInput{
 			Bucket: &bucket,
 			Key:    &obj,
 		}, s3client)
@@ -2575,16 +3850,14 @@ func GetObject_success(s *S3Conf) error {
 		if *out.ContentLength != dataLength {
 			return fmt.Errorf("expected content-length %v, instead got %v", dataLength, out.ContentLength)
 		}
+		if *out.ContentType != directoryContentType {
+			return fmt.Errorf("expected content type %v, instead got %v", directoryContentType, *out.ContentType)
+		}
+		if out.StorageClass != types.StorageClassStandard {
+			return fmt.Errorf("expected the storage class to be %v, instead got %v", types.StorageClassStandard, out.StorageClass)
+		}
 
-		bdy, err := io.ReadAll(out.Body)
-		if err != nil {
-			return err
-		}
-		defer out.Body.Close()
-		outCsum := sha256.Sum256(bdy)
-		if outCsum != csum {
-			return fmt.Errorf("invalid object data")
-		}
+		out.Body.Close()
 		return nil
 	})
 }
@@ -2594,7 +3867,7 @@ func GetObject_by_range_success(s *S3Conf) error {
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		dataLength, obj := int64(1234567), "my-obj"
 
-		_, data, err := putObjectWithData(dataLength, &s3.PutObjectInput{
+		r, err := putObjectWithData(dataLength, &s3.PutObjectInput{
 			Bucket: &bucket,
 			Key:    &obj,
 		}, s3client)
@@ -2622,12 +3895,12 @@ func GetObject_by_range_success(s *S3Conf) error {
 			return fmt.Errorf("expected accept range: %v, instead got: %v", rangeString, getString(out.AcceptRanges))
 		}
 		b, err := io.ReadAll(out.Body)
-		if err != nil {
+		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
 
 		// bytes range is inclusive, go range for second value is not
-		if !isEqual(b, data[100:201]) {
+		if !isEqual(b, r.data[100:201]) {
 			return fmt.Errorf("data mismatch of range")
 		}
 
@@ -2646,13 +3919,87 @@ func GetObject_by_range_success(s *S3Conf) error {
 		defer out.Body.Close()
 
 		b, err = io.ReadAll(out.Body)
-		if err != nil {
+		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
 
 		// bytes range is inclusive, go range for second value is not
-		if !isEqual(b, data[100:]) {
+		if !isEqual(b, r.data[100:]) {
 			return fmt.Errorf("data mismatch of range")
+		}
+		return nil
+	})
+}
+
+func GetObject_by_range_resp_status(s *S3Conf) error {
+	testName := "GetObject_by_range_resp_status"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj, dLen := "my-obj", int64(4000)
+		_, err := putObjectWithData(dLen, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		req, err := createSignedReq(
+			http.MethodGet,
+			s.endpoint,
+			fmt.Sprintf("%v/%v", bucket, obj),
+			s.awsID,
+			s.awsSecret,
+			"s3",
+			s.awsRegion,
+			nil,
+			time.Now(),
+			map[string]string{
+				"Range": "bytes=100-200",
+			},
+		)
+		if err != nil {
+			return err
+		}
+
+		client := http.Client{
+			Timeout: shortTimeout,
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+
+		if resp.StatusCode != http.StatusPartialContent {
+			return fmt.Errorf("expected response status to be %v, instead got %v", http.StatusPartialContent, resp.StatusCode)
+		}
+
+		return nil
+	})
+}
+
+func GetObject_non_existing_dir_object(s *S3Conf) error {
+	testName := "GetObject_non_existing_dir_object"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dataLength, obj := int64(1234567), "my-obj"
+
+		_, err := putObjectWithData(dataLength, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		obj = "my-obj/"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		defer cancel()
+		if err := checkSdkApiErr(err, "NoSuchKey"); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -2678,8 +4025,8 @@ func ListObjects_with_prefix(s *S3Conf) error {
 	testName := "ListObjects_with_prefix"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		prefix := "obj"
-		objWithPrefix := []string{prefix + "/foo", prefix + "/bar", prefix + "/baz/bla"}
-		err := putObjects(s3client, append(objWithPrefix, []string{"xzy/csf", "hell"}...), bucket)
+		objWithPrefix := []string{prefix + "/bar", prefix + "/baz/bla", prefix + "/foo"}
+		contents, err := putObjects(s3client, append(objWithPrefix, []string{"azy/csf", "hell"}...), bucket)
 		if err != nil {
 			return err
 		}
@@ -2697,19 +4044,46 @@ func ListObjects_with_prefix(s *S3Conf) error {
 		if *out.Prefix != prefix {
 			return fmt.Errorf("expected prefix %v, instead got %v", prefix, *out.Prefix)
 		}
-		if !compareObjects(objWithPrefix, out.Contents) {
-			return fmt.Errorf("unexpected output for list objects with prefix")
+		if !compareObjects(contents[2:], out.Contents) {
+			return fmt.Errorf("expected the output to be %v, instead got %v", contents[2:], out.Contents)
 		}
 
 		return nil
 	})
 }
 
-func ListObject_truncated(s *S3Conf) error {
-	testName := "ListObject_truncated"
+func ListObjects_paginated(s *S3Conf) error {
+	testName := "ListObjects_paginated"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		_, err := putObjects(s3client, []string{"dir1/subdir/file.txt", "dir1/subdir.ext", "dir1/subdir1.ext", "dir1/subdir2.ext"}, bucket)
+		if err != nil {
+			return err
+		}
+
+		objs, prefixes, err := listObjects(s3client, bucket, "dir1/", "/", 2)
+		if err != nil {
+			return err
+		}
+
+		expected := []string{"dir1/subdir.ext", "dir1/subdir1.ext", "dir1/subdir2.ext"}
+		if !hasObjNames(objs, expected) {
+			return fmt.Errorf("expected objects %v, instead got %v", expected, objStrings(objs))
+		}
+
+		expectedPrefix := []string{"dir1/subdir/"}
+		if !hasPrefixName(prefixes, expectedPrefix) {
+			return fmt.Errorf("expected prefixes %v, instead got %v", expectedPrefix, pfxStrings(prefixes))
+		}
+
+		return nil
+	})
+}
+
+func ListObjects_truncated(s *S3Conf) error {
+	testName := "ListObjects_truncated"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		maxKeys := int32(2)
-		err := putObjects(s3client, []string{"foo", "bar", "baz"}, bucket)
+		contents, err := putObjects(s3client, []string{"foo", "bar", "baz"}, bucket)
 		if err != nil {
 			return err
 		}
@@ -2736,8 +4110,8 @@ func ListObject_truncated(s *S3Conf) error {
 			return fmt.Errorf("expected next-marker to be baz, instead got %v", *out1.NextMarker)
 		}
 
-		if !compareObjects([]string{"bar", "baz"}, out1.Contents) {
-			return fmt.Errorf("unexpected output for list objects with max-keys")
+		if !compareObjects(contents[:2], out1.Contents) {
+			return fmt.Errorf("expected the output to be %v, instead got %v", contents[:2], out1.Contents)
 		}
 
 		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
@@ -2758,8 +4132,8 @@ func ListObject_truncated(s *S3Conf) error {
 			return fmt.Errorf("expected marker to be %v, instead got %v", *out1.NextMarker, *out2.Marker)
 		}
 
-		if !compareObjects([]string{"foo"}, out2.Contents) {
-			return fmt.Errorf("unexpected output for list objects with max-keys")
+		if !compareObjects(contents[2:], out2.Contents) {
+			return fmt.Errorf("expected the output to be %v, instead got %v", contents[2:], out2.Contents)
 		}
 		return nil
 	})
@@ -2787,7 +4161,7 @@ func ListObjects_max_keys_0(s *S3Conf) error {
 	testName := "ListObjects_max_keys_0"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		objects := []string{"foo", "bar", "baz"}
-		err := putObjects(s3client, objects, bucket)
+		_, err := putObjects(s3client, objects, bucket)
 		if err != nil {
 			return err
 		}
@@ -2813,7 +4187,7 @@ func ListObjects_max_keys_0(s *S3Conf) error {
 func ListObjects_delimiter(s *S3Conf) error {
 	testName := "ListObjects_delimiter"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		err := putObjects(s3client, []string{"foo/bar/baz", "foo/bar/xyzzy", "quux/thud", "asdf"}, bucket)
+		_, err := putObjects(s3client, []string{"foo/bar/baz", "foo/bar/xyzzy", "quux/thud", "asdf"}, bucket)
 		if err != nil {
 			return err
 		}
@@ -2849,7 +4223,7 @@ func ListObjects_delimiter(s *S3Conf) error {
 func ListObjects_max_keys_none(s *S3Conf) error {
 	testName := "ListObjects_max_keys_none"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		err := putObjects(s3client, []string{"foo", "bar", "baz"}, bucket)
+		_, err := putObjects(s3client, []string{"foo", "bar", "baz"}, bucket)
 		if err != nil {
 			return err
 		}
@@ -2874,7 +4248,7 @@ func ListObjects_max_keys_none(s *S3Conf) error {
 func ListObjects_marker_not_from_obj_list(s *S3Conf) error {
 	testName := "ListObjects_marker_not_from_obj_list"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		err := putObjects(s3client, []string{"foo", "bar", "baz", "qux", "hello", "xyz"}, bucket)
+		contents, err := putObjects(s3client, []string{"foo", "bar", "baz", "qux", "hello", "xyz"}, bucket)
 		if err != nil {
 			return err
 		}
@@ -2889,8 +4263,46 @@ func ListObjects_marker_not_from_obj_list(s *S3Conf) error {
 			return err
 		}
 
-		if !compareObjects([]string{"foo", "qux", "hello", "xyz"}, out.Contents) {
-			return fmt.Errorf("expected output to be %v, instead got %v", []string{"foo", "qux", "hello", "xyz"}, out.Contents)
+		if !compareObjects(contents[2:], out.Contents) {
+			return fmt.Errorf("expected output to be %v, instead got %v", contents, out.Contents)
+		}
+
+		return nil
+	})
+}
+
+func ListObjects_list_all_objs(s *S3Conf) error {
+	testName := "ListObjects_list_all_objs"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		contents, err := putObjects(s3client, []string{"foo", "bar", "baz", "quxx/ceil", "ceil", "hello/world"}, bucket)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.ListObjects(ctx, &s3.ListObjectsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if out.Marker != nil {
+			return fmt.Errorf("expected the Marker to be nil, instead got %v", *out.Marker)
+		}
+		if out.NextMarker != nil {
+			return fmt.Errorf("expected the NextMarker to be nil, instead got %v", *out.NextMarker)
+		}
+		if out.Delimiter != nil {
+			return fmt.Errorf("expected the Delimiter to be nil, instead got %v", *out.Delimiter)
+		}
+		if out.Prefix != nil {
+			return fmt.Errorf("expected the Prefix to be nil, instead got %v", *out.Prefix)
+		}
+
+		if !compareObjects(out.Contents, contents) {
+			return fmt.Errorf("expected the contents to be %v, instead got %v", contents, out.Contents)
 		}
 
 		return nil
@@ -2900,23 +4312,27 @@ func ListObjects_marker_not_from_obj_list(s *S3Conf) error {
 func ListObjectsV2_start_after(s *S3Conf) error {
 	testName := "ListObjectsV2_start_after"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		err := putObjects(s3client, []string{"foo", "bar", "baz"}, bucket)
+		contents, err := putObjects(s3client, []string{"foo", "bar", "baz"}, bucket)
 		if err != nil {
 			return err
 		}
 
+		startAfter := "bar"
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 		out, err := s3client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:     &bucket,
-			StartAfter: getPtr("bar"),
+			StartAfter: &startAfter,
 		})
 		cancel()
 		if err != nil {
 			return err
 		}
 
-		if !compareObjects([]string{"baz", "foo"}, out.Contents) {
-			return fmt.Errorf("expected output to be %v, instead got %v", []string{"baz", "foo"}, out.Contents)
+		if *out.StartAfter != startAfter {
+			return fmt.Errorf("expected StartAfter to be %v, insted got %v", startAfter, *out.StartAfter)
+		}
+		if !compareObjects(contents[1:], out.Contents) {
+			return fmt.Errorf("expected the output to be %v, instead got %v", contents, out.Contents)
 		}
 
 		return nil
@@ -2926,7 +4342,7 @@ func ListObjectsV2_start_after(s *S3Conf) error {
 func ListObjectsV2_both_start_after_and_continuation_token(s *S3Conf) error {
 	testName := "ListObjectsV2_both_start_after_and_continuation_token"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		err := putObjects(s3client, []string{"foo", "bar", "baz", "quxx"}, bucket)
+		contents, err := putObjects(s3client, []string{"foo", "bar", "baz", "quxx"}, bucket)
 		if err != nil {
 			return err
 		}
@@ -2954,8 +4370,8 @@ func ListObjectsV2_both_start_after_and_continuation_token(s *S3Conf) error {
 			return fmt.Errorf("expected next-marker to be baz, instead got %v", *out.NextContinuationToken)
 		}
 
-		if !compareObjects([]string{"bar"}, out.Contents) {
-			return fmt.Errorf("unexpected output for list objects with max-keys")
+		if !compareObjects(contents[:1], out.Contents) {
+			return fmt.Errorf("expected the output to be %v, instead got %v", contents[:1], out.Contents)
 		}
 
 		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
@@ -2969,8 +4385,8 @@ func ListObjectsV2_both_start_after_and_continuation_token(s *S3Conf) error {
 			return err
 		}
 
-		if !compareObjects([]string{"foo", "quxx"}, resp.Contents) {
-			return fmt.Errorf("unexpected output for list objects with max-keys")
+		if !compareObjects(contents[2:], resp.Contents) {
+			return fmt.Errorf("expected the output to be %v, instead got %v", contents[2:], resp.Contents)
 		}
 
 		return nil
@@ -2980,7 +4396,7 @@ func ListObjectsV2_both_start_after_and_continuation_token(s *S3Conf) error {
 func ListObjectsV2_start_after_not_in_list(s *S3Conf) error {
 	testName := "ListObjectsV2_start_after_not_in_list"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		err := putObjects(s3client, []string{"foo", "bar", "baz", "quxx"}, bucket)
+		contents, err := putObjects(s3client, []string{"foo", "bar", "baz", "quxx"}, bucket)
 		if err != nil {
 			return err
 		}
@@ -2995,8 +4411,8 @@ func ListObjectsV2_start_after_not_in_list(s *S3Conf) error {
 			return err
 		}
 
-		if !compareObjects([]string{"foo", "quxx"}, out.Contents) {
-			return fmt.Errorf("expected output to be %v, instead got %v", []string{"foo", "quxx"}, out.Contents)
+		if !compareObjects(contents[2:], out.Contents) {
+			return fmt.Errorf("expected the output to be %v, instead got %v", contents[2:], out.Contents)
 		}
 
 		return nil
@@ -3006,7 +4422,7 @@ func ListObjectsV2_start_after_not_in_list(s *S3Conf) error {
 func ListObjectsV2_start_after_empty_result(s *S3Conf) error {
 	testName := "ListObjectsV2_start_after_empty_result"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		err := putObjects(s3client, []string{"foo", "bar", "baz", "quxx"}, bucket)
+		_, err := putObjects(s3client, []string{"foo", "bar", "baz", "quxx"}, bucket)
 		if err != nil {
 			return err
 		}
@@ -3029,6 +4445,316 @@ func ListObjectsV2_start_after_empty_result(s *S3Conf) error {
 	})
 }
 
+func ListObjectsV2_both_delimiter_and_prefix(s *S3Conf) error {
+	testName := "ListObjectsV2_both_delimiter_and_prefix"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		_, err := putObjects(s3client, []string{
+			"sample.jpg",
+			"photos/2006/January/sample.jpg",
+			"photos/2006/February/sample2.jpg",
+			"photos/2006/February/sample3.jpg",
+			"photos/2006/February/sample4.jpg",
+		}, bucket)
+		if err != nil {
+			return err
+		}
+		delim, prefix := "/", "photos/2006/"
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:    &bucket,
+			Delimiter: &delim,
+			Prefix:    &prefix,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if res.Delimiter == nil || *res.Delimiter != delim {
+			return fmt.Errorf("expected the delimiter to be %v", delim)
+		}
+		if res.Prefix == nil || *res.Prefix != prefix {
+			return fmt.Errorf("expected the prefix to be %v", prefix)
+		}
+		if !comparePrefixes([]string{"photos/2006/February/", "photos/2006/January/"}, res.CommonPrefixes) {
+			return fmt.Errorf("expected the common prefixes to be %v, instead got %v", []string{"photos/2006/February/", "photos/2006/January/"}, res.CommonPrefixes)
+		}
+		if len(res.Contents) != 0 {
+			return fmt.Errorf("expected empty objects list, instead got %v", res.Contents)
+		}
+
+		return nil
+	})
+}
+
+func ListObjectsV2_single_dir_object_with_delim_and_prefix(s *S3Conf) error {
+	testName := "ListObjectsV2_single_dir_object_with_delim_and_prefix"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		contents, err := putObjects(s3client, []string{"a/"}, bucket)
+		if err != nil {
+			return err
+		}
+
+		delim, prefix := "/", "a"
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:    &bucket,
+			Delimiter: &delim,
+			Prefix:    &prefix,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !comparePrefixes([]string{"a/"}, res.CommonPrefixes) {
+			return fmt.Errorf("expected the common prefixes to be %v, instead got %v", []string{"a/"}, res.CommonPrefixes)
+		}
+		if len(res.Contents) != 0 {
+			return fmt.Errorf("expected empty objects list, instead got %v", res.Contents)
+		}
+
+		prefix = "a/"
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		res, err = s3client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:    &bucket,
+			Delimiter: &delim,
+			Prefix:    &prefix,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !compareObjects(contents, res.Contents) {
+			return fmt.Errorf("expected the object list to be %v, instead got %v", []string{"a/"}, res.Contents)
+		}
+		if len(res.CommonPrefixes) != 0 {
+			return fmt.Errorf("expected empty common prefixes, instead got %v", res.CommonPrefixes)
+		}
+
+		return nil
+	})
+}
+
+func ListObjectsV2_truncated_common_prefixes(s *S3Conf) error {
+	testName := "ListObjectsV2_truncated_common_prefixes"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		_, err := putObjects(s3client, []string{"d1/f1", "d2/f2", "d3/f3", "d4/f4"}, bucket)
+		if err != nil {
+			return err
+		}
+
+		delim, maxKeys := "/", int32(3)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:    &bucket,
+			Delimiter: &delim,
+			MaxKeys:   &maxKeys,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !comparePrefixes([]string{"d1/", "d2/", "d3/"}, out.CommonPrefixes) {
+			return fmt.Errorf("expected the common prefixes to be %v, instead got %v", []string{"d1/", "d2/", "d3/"}, out.CommonPrefixes)
+		}
+		if *out.MaxKeys != maxKeys {
+			return fmt.Errorf("expected the max-keys to be %v, instead got %v", maxKeys, *out.MaxKeys)
+		}
+		if *out.NextContinuationToken != "d3/" {
+			return fmt.Errorf("expected the NextContinuationToken to be d3/, instead got %v", *out.NextContinuationToken)
+		}
+		if *out.Delimiter != delim {
+			return fmt.Errorf("expected the delimiter to be %v, instead got %v", delim, *out.Delimiter)
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		out, err = s3client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            &bucket,
+			Delimiter:         &delim,
+			ContinuationToken: out.NextContinuationToken,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !comparePrefixes([]string{"d4/"}, out.CommonPrefixes) {
+			return fmt.Errorf("expected the common prefixes to be %v, instead got %v", []string{"d4/"}, out.CommonPrefixes)
+		}
+		if *out.Delimiter != delim {
+			return fmt.Errorf("expected the delimiter to be %v, instead got %v", delim, *out.Delimiter)
+		}
+
+		return nil
+	})
+}
+
+func ListObjectsV2_all_objs_max_keys(s *S3Conf) error {
+	testName := "ListObjectsV2_all_objs_max_keys"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		contents, err := putObjects(s3client, []string{"bar", "baz", "foo"}, bucket)
+		if err != nil {
+			return err
+		}
+
+		maxKeys := int32(3)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:  &bucket,
+			MaxKeys: &maxKeys,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *out.IsTruncated {
+			return fmt.Errorf("expected the output not to be truncated")
+		}
+		if getString(out.NextContinuationToken) != "" {
+			return fmt.Errorf("expected empty NextContinuationToken, instead got %v", *out.NextContinuationToken)
+		}
+		if *out.MaxKeys != maxKeys {
+			return fmt.Errorf("expected the max-keys to be %v, instead got %v", maxKeys, *out.MaxKeys)
+		}
+
+		if !compareObjects(contents, out.Contents) {
+			return fmt.Errorf("expected the objects list to be %v, instead got %v", contents, out.Contents)
+		}
+
+		return nil
+	})
+}
+
+func ListObjectsV2_list_all_objs(s *S3Conf) error {
+	testName := "ListObjectsV2_list_all_objs"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		contents, err := putObjects(s3client, []string{"bar", "baz", "foo", "obj1", "hell/", "xyzz/quxx"}, bucket)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if out.StartAfter != nil {
+			return fmt.Errorf("expected the StartAfter to be nil, instead got %v", *out.StartAfter)
+		}
+		if out.ContinuationToken != nil {
+			return fmt.Errorf("expected the ContinuationToken to be nil, instead got %v", *out.ContinuationToken)
+		}
+		if out.NextContinuationToken != nil {
+			return fmt.Errorf("expected the NextContinuationToken to be nil, instead got %v", *out.NextContinuationToken)
+		}
+		if out.Delimiter != nil {
+			return fmt.Errorf("expected the Delimiter to be nil, instead got %v", *out.Delimiter)
+		}
+		if out.Prefix != nil {
+			return fmt.Errorf("expected the Prefix to be nil, instead got %v", *out.Prefix)
+		}
+
+		if !compareObjects(out.Contents, contents) {
+			return fmt.Errorf("expected the contents to be %v, instead got %v", contents, out.Contents)
+		}
+
+		return nil
+	})
+}
+
+func ListObjectsV2_invalid_parent_prefix(s *S3Conf) error {
+	testName := "ListObjectsV2_invalid_parent_prefix"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		_, err := putObjects(s3client, []string{"file"}, bucket)
+		if err != nil {
+			return err
+		}
+
+		delim, maxKeys := "/", int32(100)
+		prefix := "file/file/file"
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:    &bucket,
+			Delimiter: &delim,
+			MaxKeys:   &maxKeys,
+			Prefix:    &prefix,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if len(out.CommonPrefixes) > 0 {
+			return fmt.Errorf("expected the common prefixes to be %v, instead got %v", []string{""}, out.CommonPrefixes)
+		}
+		if *out.MaxKeys != maxKeys {
+			return fmt.Errorf("expected the max-keys to be %v, instead got %v", maxKeys, *out.MaxKeys)
+		}
+		if *out.Delimiter != delim {
+			return fmt.Errorf("expected the delimiter to be %v, instead got %v", delim, *out.Delimiter)
+		}
+		if len(out.Contents) > 0 {
+			return fmt.Errorf("expected the objects to be %v, instead got %v", []types.Object{}, out.Contents)
+		}
+		return nil
+	})
+}
+
+func ListObjectVersions_VD_success(s *S3Conf) error {
+	testName := "ListObjectVersions_VD_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		versions := []types.ObjectVersion{}
+		for i := 0; i < 5; i++ {
+			dLgth := int64(i * 100)
+			key := fmt.Sprintf("my-obj-%v", i)
+			out, err := putObjectWithData(dLgth, &s3.PutObjectInput{
+				Bucket: &bucket,
+				Key:    &key,
+			}, s3client)
+			if err != nil {
+				return err
+			}
+
+			versions = append(versions, types.ObjectVersion{
+				ETag:         out.res.ETag,
+				IsLatest:     getBoolPtr(true),
+				Key:          &key,
+				Size:         &dLgth,
+				VersionId:    getPtr("null"),
+				StorageClass: types.ObjectVersionStorageClassStandard,
+			})
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !compareVersions(res.Versions, versions) {
+			return fmt.Errorf("expected object versions output to be %v, instead got %v", versions, res.Versions)
+		}
+		return nil
+	})
+}
+
 func DeleteObject_non_existing_object(s *S3Conf) error {
 	testName := "DeleteObject_non_existing_object"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
@@ -3038,10 +4764,97 @@ func DeleteObject_non_existing_object(s *S3Conf) error {
 			Key:    getPtr("my-obj"),
 		})
 		cancel()
-		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchKey)); err != nil {
+		return err
+	})
+}
+
+func DeleteObject_directory_object_noslash(s *S3Conf) error {
+	testName := "DeleteObject_directory_object_noslash"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj/"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		obj = "my-obj"
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		// the delete above should succeed, but the object should not be deleted
+		// since it should not correctly match the directory name
+		// so the below head object should also succeed
+		obj = "my-obj/"
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		return err
+	})
+}
+
+func DeleteObject_directory_not_empty(s *S3Conf) error {
+	testName := "DeleteObject_directory_not_empty"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "dir/my-obj"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		obj = "dir/"
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		// object servers will return no error, but the posix backend returns
+		// a non-standard directory not empty. This test is a posix only test
+		// to validate the specific error response.
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrDirectoryNotEmpty)); err != nil {
 			return err
 		}
 		return nil
+	})
+}
+
+func DeleteObject_non_existing_dir_object(s *S3Conf) error {
+	testName := "DeleteObject_non_existing_dir_object"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := putObjects(s3client, []string{obj}, bucket)
+		if err != nil {
+			return err
+		}
+
+		obj = "my-obj/"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		return err
 	})
 }
 
@@ -3049,7 +4862,7 @@ func DeleteObject_success(s *S3Conf) error {
 	testName := "DeleteObject_success"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj := "my-obj"
-		err := putObjects(s3client, []string{obj}, bucket)
+		_, err := putObjects(s3client, []string{obj}, bucket)
 		if err != nil {
 			return err
 		}
@@ -3081,12 +4894,12 @@ func DeleteObject_success_status_code(s *S3Conf) error {
 	testName := "DeleteObject_success_status_code"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj := "my-obj"
-		err := putObjects(s3client, []string{obj}, bucket)
+		_, err := putObjects(s3client, []string{obj}, bucket)
 		if err != nil {
 			return err
 		}
 
-		req, err := createSignedReq(http.MethodDelete, s.endpoint, fmt.Sprintf("%v/%v", bucket, obj), s.awsID, s.awsSecret, "s3", s.awsRegion, nil, time.Now())
+		req, err := createSignedReq(http.MethodDelete, s.endpoint, fmt.Sprintf("%v/%v", bucket, obj), s.awsID, s.awsSecret, "s3", s.awsRegion, nil, time.Now(), nil)
 		if err != nil {
 			return err
 		}
@@ -3111,8 +4924,7 @@ func DeleteObject_success_status_code(s *S3Conf) error {
 func DeleteObjects_empty_input(s *S3Conf) error {
 	testName := "DeleteObjects_empty_input"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		objects := []string{"foo", "bar", "baz"}
-		err := putObjects(s3client, objects, bucket)
+		contents, err := putObjects(s3client, []string{"foo", "bar", "baz"}, bucket)
 		if err != nil {
 			return err
 		}
@@ -3145,8 +4957,8 @@ func DeleteObjects_empty_input(s *S3Conf) error {
 			return err
 		}
 
-		if !compareObjects(objects, res.Contents) {
-			return fmt.Errorf("unexpected output for list objects with prefix")
+		if !compareObjects(contents, res.Contents) {
+			return fmt.Errorf("expected the output to be %v, instead got %v", contents, res.Contents)
 		}
 
 		return nil
@@ -3170,17 +4982,11 @@ func DeleteObjects_non_existing_objects(s *S3Conf) error {
 			return err
 		}
 
-		if len(out.Deleted) != 0 {
-			return fmt.Errorf("expected deleted object count 0, instead got %v", len(out.Deleted))
+		if len(out.Deleted) != 2 {
+			return fmt.Errorf("expected deleted object count 2, instead got %v", len(out.Deleted))
 		}
-		if len(out.Errors) != 2 {
-			return fmt.Errorf("expected 2 errors, instead got %v", len(out.Errors))
-		}
-
-		for _, delErr := range out.Errors {
-			if *delErr.Code != "NoSuchKey" {
-				return fmt.Errorf("expected NoSuchKey error, instead got %v", *delErr.Code)
-			}
+		if len(out.Errors) != 0 {
+			return fmt.Errorf("expected 0 errors, instead got %v, %v", len(out.Errors), out.Errors)
 		}
 
 		return nil
@@ -3191,15 +4997,17 @@ func DeleteObjects_success(s *S3Conf) error {
 	testName := "DeleteObjects_success"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		objects, objToDel := []string{"obj1", "obj2", "obj3"}, []string{"foo", "bar", "baz"}
-		err := putObjects(s3client, append(objToDel, objects...), bucket)
+		contents, err := putObjects(s3client, append(objToDel, objects...), bucket)
 		if err != nil {
 			return err
 		}
 
 		delObjects := []types.ObjectIdentifier{}
+		delResult := []types.DeletedObject{}
 		for _, key := range objToDel {
 			k := key
 			delObjects = append(delObjects, types.ObjectIdentifier{Key: &k})
+			delResult = append(delResult, types.DeletedObject{Key: &k})
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 		out, err := s3client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
@@ -3220,7 +5028,7 @@ func DeleteObjects_success(s *S3Conf) error {
 			return fmt.Errorf("expected 2 errors, instead got %v", len(out.Errors))
 		}
 
-		if !compareDelObjects(objToDel, out.Deleted) {
+		if !compareDelObjects(delResult, out.Deleted) {
 			return fmt.Errorf("unexpected deleted output")
 		}
 
@@ -3233,8 +5041,8 @@ func DeleteObjects_success(s *S3Conf) error {
 			return err
 		}
 
-		if !compareObjects(objects, res.Contents) {
-			return fmt.Errorf("unexpected output for list objects with prefix")
+		if !compareObjects(contents[3:], res.Contents) {
+			return fmt.Errorf("expected the output to be %v, instead got %v", contents[3:], res.Contents)
 		}
 
 		return nil
@@ -3245,7 +5053,7 @@ func CopyObject_non_existing_dst_bucket(s *S3Conf) error {
 	testName := "CopyObject_non_existing_dst_bucket"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj := "my-obj"
-		err := putObjects(s3client, []string{obj}, bucket)
+		_, err := putObjects(s3client, []string{obj}, bucket)
 		if err != nil {
 			return err
 		}
@@ -3267,7 +5075,7 @@ func CopyObject_not_owned_source_bucket(s *S3Conf) error {
 	testName := "CopyObject_not_owned_source_bucket"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		srcObj := "my-obj"
-		err := putObjects(s3client, []string{srcObj}, bucket)
+		_, err := putObjects(s3client, []string{srcObj}, bucket)
 		if err != nil {
 			return err
 		}
@@ -3323,7 +5131,7 @@ func CopyObject_copy_to_itself(s *S3Conf) error {
 	testName := "CopyObject_copy_to_itself"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj := "my-obj"
-		err := putObjects(s3client, []string{obj}, bucket)
+		_, err := putObjects(s3client, []string{obj}, bucket)
 		if err != nil {
 			return err
 		}
@@ -3341,26 +5149,198 @@ func CopyObject_copy_to_itself(s *S3Conf) error {
 	})
 }
 
-func CopyObject_to_itself_with_new_metadata(s *S3Conf) error {
-	testName := "CopyObject_to_itself_with_new_metadata"
+func CopyObject_copy_to_itself_invalid_directive(s *S3Conf) error {
+	testName := "CopyObject_copy_to_itself_invalid_directive"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj := "my-obj"
-		err := putObjects(s3client, []string{obj}, bucket)
+		_, err := putObjects(s3client, []string{obj}, bucket)
 		if err != nil {
 			return err
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 		_, err = s3client.CopyObject(ctx, &s3.CopyObjectInput{
-			Bucket:     &bucket,
-			Key:        &obj,
-			CopySource: getPtr(fmt.Sprintf("%v/%v", bucket, obj)),
-			Metadata: map[string]string{
-				"Hello": "World",
-			},
+			Bucket:            &bucket,
+			Key:               &obj,
+			CopySource:        getPtr(fmt.Sprintf("%v/%v", bucket, obj)),
+			MetadataDirective: types.MetadataDirective("invalid"),
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidMetadataDirective)); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func CopyObject_to_itself_with_new_metadata(s *S3Conf) error {
+	testName := "CopyObject_to_itself_with_new_metadata"
+
+	meta := map[string]string{
+		"Hello": "World",
+	}
+
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := putObjects(s3client, []string{obj}, bucket)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:            &bucket,
+			Key:               &obj,
+			CopySource:        getPtr(fmt.Sprintf("%v/%v", bucket, obj)),
+			Metadata:          meta,
+			MetadataDirective: types.MetadataDirectiveReplace,
 		})
 		cancel()
 		if err != nil {
 			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		resp, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !areMapsSame(resp.Metadata, meta) {
+			return fmt.Errorf("expected uploaded object metadata to be %v, instead got %v", meta, resp.Metadata)
+		}
+
+		// verify updating metadata has correct meta
+		meta = map[string]string{
+			"New": "Metadata",
+		}
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:            &bucket,
+			Key:               &obj,
+			CopySource:        getPtr(fmt.Sprintf("%v/%v", bucket, obj)),
+			Metadata:          meta,
+			MetadataDirective: types.MetadataDirectiveReplace,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		resp, err = s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !areMapsSame(resp.Metadata, meta) {
+			return fmt.Errorf("expected uploaded object metadata to be %v, instead got %v", meta, resp.Metadata)
+		}
+
+		return nil
+	})
+}
+
+func CopyObject_CopySource_starting_with_slash(s *S3Conf) error {
+	testName := "CopyObject_CopySource_starting_with_slash"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dataLength, obj := int64(1234567), "src-obj"
+		dstBucket := getBucketName()
+		if err := setup(s, dstBucket); err != nil {
+			return err
+		}
+
+		r, err := putObjectWithData(dataLength, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:     &dstBucket,
+			Key:        &obj,
+			CopySource: getPtr(fmt.Sprintf("/%v/%v", bucket, obj)),
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: &dstBucket,
+			Key:    &obj,
+		})
+		defer cancel()
+		if err != nil {
+			return err
+		}
+		if *out.ContentLength != dataLength {
+			return fmt.Errorf("expected content-length %v, instead got %v", dataLength, *out.ContentLength)
+		}
+
+		defer out.Body.Close()
+
+		bdy, err := io.ReadAll(out.Body)
+		if err != nil {
+			return err
+		}
+		outCsum := sha256.Sum256(bdy)
+		if outCsum != r.csum {
+			return fmt.Errorf("invalid object data")
+		}
+
+		if err := teardown(s, dstBucket); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func CopyObject_non_existing_dir_object(s *S3Conf) error {
+	testName := "CopyObject_non_existing_dir_object"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dataLength, obj := int64(1234567), "my-obj"
+		dstBucket := getBucketName()
+		err := setup(s, dstBucket)
+		if err != nil {
+			return err
+		}
+
+		_, err = putObjectWithData(dataLength, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		obj = "my-obj/"
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:     &dstBucket,
+			Key:        &obj,
+			CopySource: getPtr(fmt.Sprintf("%v/%v", bucket, obj)),
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchKey)); err != nil {
+			return err
+		}
+
+		err = teardown(s, dstBucket)
+		if err != nil {
+			return nil
 		}
 
 		return nil
@@ -3370,14 +5350,14 @@ func CopyObject_to_itself_with_new_metadata(s *S3Conf) error {
 func CopyObject_success(s *S3Conf) error {
 	testName := "CopyObject_success"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		dataLength, obj := int64(1234567), "my-obj"
+		dataLength, obj := int64(1234567), "my obj with spaces"
 		dstBucket := getBucketName()
 		err := setup(s, dstBucket)
 		if err != nil {
 			return err
 		}
 
-		csum, _, err := putObjectWithData(dataLength, &s3.PutObjectInput{
+		r, err := putObjectWithData(dataLength, &s3.PutObjectInput{
 			Bucket: &bucket,
 			Key:    &obj,
 		}, s3client)
@@ -3406,7 +5386,7 @@ func CopyObject_success(s *S3Conf) error {
 			return err
 		}
 		if *out.ContentLength != dataLength {
-			return fmt.Errorf("expected content-length %v, instead got %v", dataLength, out.ContentLength)
+			return fmt.Errorf("expected content-length %v, instead got %v", dataLength, *out.ContentLength)
 		}
 
 		bdy, err := io.ReadAll(out.Body)
@@ -3415,7 +5395,7 @@ func CopyObject_success(s *S3Conf) error {
 		}
 		defer out.Body.Close()
 		outCsum := sha256.Sum256(bdy)
-		if outCsum != csum {
+		if outCsum != r.csum {
 			return fmt.Errorf("invalid object data")
 		}
 
@@ -3449,7 +5429,7 @@ func PutObjectTagging_long_tags(s *S3Conf) error {
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj := "my-obj"
 		tagging := types.Tagging{TagSet: []types.Tag{{Key: getPtr(genRandString(129)), Value: getPtr("val")}}}
-		err := putObjects(s3client, []string{obj}, bucket)
+		_, err := putObjects(s3client, []string{obj}, bucket)
 		if err != nil {
 			return err
 		}
@@ -3485,7 +5465,7 @@ func PutObjectTagging_success(s *S3Conf) error {
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj := "my-obj"
 		tagging := types.Tagging{TagSet: []types.Tag{{Key: getPtr("key1"), Value: getPtr("val2")}, {Key: getPtr("key2"), Value: getPtr("val2")}}}
-		err := putObjects(s3client, []string{obj}, bucket)
+		_, err := putObjects(s3client, []string{obj}, bucket)
 		if err != nil {
 			return err
 		}
@@ -3520,12 +5500,56 @@ func GetObjectTagging_non_existing_object(s *S3Conf) error {
 	})
 }
 
+func GetObjectTagging_unset_tags(s *S3Conf) error {
+	testName := "GetObjectTagging_unset_tags"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := putObjects(s3client, []string{obj}, bucket)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrBucketTaggingNotFound)); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func GetObjectTagging_invalid_parent(s *S3Conf) error {
+	testName := "GetObjectTagging_invalid_parent"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "not-a-dir"
+		_, err := putObjects(s3client, []string{obj}, bucket)
+		if err != nil {
+			return err
+		}
+
+		obj = "not-a-dir/bad-obj"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchKey)); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 func GetObjectTagging_success(s *S3Conf) error {
 	testName := "PutObjectTagging_success"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj := "my-obj"
 		tagging := types.Tagging{TagSet: []types.Tag{{Key: getPtr("key1"), Value: getPtr("val2")}, {Key: getPtr("key2"), Value: getPtr("val2")}}}
-		err := putObjects(s3client, []string{obj}, bucket)
+		_, err := putObjects(s3client, []string{obj}, bucket)
 		if err != nil {
 			return err
 		}
@@ -3578,7 +5602,7 @@ func DeleteObjectTagging_success_status(s *S3Conf) error {
 	testName := "DeleteObjectTagging_success_status"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj := "my-obj"
-		err := putObjects(s3client, []string{obj}, bucket)
+		_, err := putObjects(s3client, []string{obj}, bucket)
 		if err != nil {
 			return err
 		}
@@ -3603,7 +5627,7 @@ func DeleteObjectTagging_success_status(s *S3Conf) error {
 			return err
 		}
 
-		req, err := createSignedReq(http.MethodDelete, s.endpoint, fmt.Sprintf("%v/%v?tagging", bucket, obj), s.awsID, s.awsSecret, "s3", s.awsRegion, nil, time.Now())
+		req, err := createSignedReq(http.MethodDelete, s.endpoint, fmt.Sprintf("%v/%v?tagging", bucket, obj), s.awsID, s.awsSecret, "s3", s.awsRegion, nil, time.Now(), nil)
 		if err != nil {
 			return err
 		}
@@ -3630,7 +5654,7 @@ func DeleteObjectTagging_success(s *S3Conf) error {
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj := "my-obj"
 		tagging := types.Tagging{TagSet: []types.Tag{{Key: getPtr("key1"), Value: getPtr("val2")}, {Key: getPtr("key2"), Value: getPtr("val2")}}}
-		err := putObjects(s3client, []string{obj}, bucket)
+		_, err := putObjects(s3client, []string{obj}, bucket)
 		if err != nil {
 			return err
 		}
@@ -3680,6 +5704,381 @@ func CreateMultipartUpload_non_existing_bucket(s *S3Conf) error {
 		_, err := createMp(s3client, bucketName, "my-obj")
 		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchBucket)); err != nil {
 			return err
+		}
+
+		return nil
+	})
+}
+
+func CreateMultipartUpload_with_metadata(s *S3Conf) error {
+	testName := "CreateMultipartUpload_with_metadata"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		meta := map[string]string{
+			"prop1": "val1",
+			"prop2": "val2",
+		}
+		contentType := "application/text"
+		contentEncoding := "testenc"
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket:          &bucket,
+			Key:             &obj,
+			Metadata:        meta,
+			ContentType:     &contentType,
+			ContentEncoding: &contentEncoding,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		parts, _, err := uploadParts(s3client, 100, 1, bucket, obj, *out.UploadId)
+		if err != nil {
+			return err
+		}
+
+		compParts := []types.CompletedPart{}
+		for _, el := range parts {
+			compParts = append(compParts, types.CompletedPart{
+				ETag:       el.ETag,
+				PartNumber: el.PartNumber,
+			})
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:   &bucket,
+			Key:      &obj,
+			UploadId: out.UploadId,
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: compParts,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		resp, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !areMapsSame(resp.Metadata, meta) {
+			return fmt.Errorf("expected uploaded object metadata to be %v, instead got %v", meta, resp.Metadata)
+		}
+
+		if resp.ContentType == nil {
+			return fmt.Errorf("expected uploaded object content-type to be %v, instead got nil", contentType)
+		}
+		if *resp.ContentType != contentType {
+			return fmt.Errorf("expected uploaded object content-type to be %v, instead got %v", contentType, *resp.ContentType)
+		}
+		if resp.ContentEncoding == nil {
+			return fmt.Errorf("expected uploaded object content-encoding to be %v, instead got nil", contentEncoding)
+		}
+		if *resp.ContentEncoding != contentEncoding {
+			return fmt.Errorf("expected uploaded object content-encoding to be %v, instead got %v", contentEncoding, *resp.ContentEncoding)
+		}
+
+		return nil
+	})
+}
+
+func CreateMultipartUpload_with_content_type(s *S3Conf) error {
+	testName := "CreateMultipartUpload_with_content_type"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		cType := "application/octet-stream"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket:      &bucket,
+			Key:         &obj,
+			ContentType: &cType,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		parts, _, err := uploadParts(s3client, 100, 1, bucket, obj, *out.UploadId)
+		if err != nil {
+			return err
+		}
+
+		compParts := []types.CompletedPart{}
+		for _, el := range parts {
+			compParts = append(compParts, types.CompletedPart{
+				ETag:       el.ETag,
+				PartNumber: el.PartNumber,
+			})
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:   &bucket,
+			Key:      &obj,
+			UploadId: out.UploadId,
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: compParts,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		resp, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *resp.ContentType != cType {
+			return fmt.Errorf("expected uploaded object content-type to be %v, instead got %v", cType, *resp.ContentType)
+		}
+
+		return nil
+	})
+}
+
+func CreateMultipartUpload_with_object_lock(s *S3Conf) error {
+	testName := "CreateMultipartUpload_with_object_lock"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		retainUntilDate := time.Now().Add(24 * time.Hour)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket:                    &bucket,
+			Key:                       &obj,
+			ObjectLockLegalHoldStatus: types.ObjectLockLegalHoldStatusOn,
+			ObjectLockMode:            types.ObjectLockModeGovernance,
+			ObjectLockRetainUntilDate: &retainUntilDate,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		parts, _, err := uploadParts(s3client, 100, 1, bucket, obj, *out.UploadId)
+		if err != nil {
+			return err
+		}
+
+		compParts := []types.CompletedPart{}
+		for _, el := range parts {
+			compParts = append(compParts, types.CompletedPart{
+				ETag:       el.ETag,
+				PartNumber: el.PartNumber,
+			})
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:   &bucket,
+			Key:      &obj,
+			UploadId: out.UploadId,
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: compParts,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		resp, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if resp.ObjectLockLegalHoldStatus != types.ObjectLockLegalHoldStatusOn {
+			return fmt.Errorf("expected uploaded object legal hold status to be %v, instead got %v", types.ObjectLockLegalHoldStatusOn, resp.ObjectLockLegalHoldStatus)
+		}
+		if resp.ObjectLockMode != types.ObjectLockModeGovernance {
+			return fmt.Errorf("expected uploaded object lock mode to be %v, instead got %v", types.ObjectLockModeGovernance, resp.ObjectLockMode)
+		}
+
+		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock())
+}
+
+func CreateMultipartUpload_with_object_lock_not_enabled(s *S3Conf) error {
+	testName := "CreateMultipartUpload_with_object_lock_not_enabled"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket:                    &bucket,
+			Key:                       &obj,
+			ObjectLockLegalHoldStatus: types.ObjectLockLegalHoldStatusOn,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidBucketObjectLockConfiguration)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func CreateMultipartUpload_with_object_lock_invalid_retention(s *S3Conf) error {
+	testName := "CreateMultipartUpload_with_object_lock_invalid_retention"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		retentionDate := time.Now().Add(24 * time.Hour)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket:         &bucket,
+			Key:            &obj,
+			ObjectLockMode: types.ObjectLockModeGovernance,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLockInvalidHeaders)); err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket:                    &bucket,
+			Key:                       &obj,
+			ObjectLockRetainUntilDate: &retentionDate,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLockInvalidHeaders)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func CreateMultipartUpload_past_retain_until_date(s *S3Conf) error {
+	testName := "CreateMultipartUpload_past_retain_until_date"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		rDate := time.Now().Add(-5 * time.Hour)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket:                    &bucket,
+			Key:                       &obj,
+			ObjectLockMode:            types.ObjectLockModeGovernance,
+			ObjectLockRetainUntilDate: &rDate,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrPastObjectLockRetainDate)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func CreateMultipartUpload_with_invalid_tagging(s *S3Conf) error {
+	testName := "CreateMultipartUpload_with_invalid_tagging"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket:  &bucket,
+			Key:     &obj,
+			Tagging: getPtr("invalid_tag"),
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidTag)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func CreateMultipartUpload_with_tagging(s *S3Conf) error {
+	testName := "CreateMultipartUpload_with_tagging"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		tagging := "key1=val1&key2=val2"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket:  &bucket,
+			Key:     &obj,
+			Tagging: &tagging,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		parts, _, err := uploadParts(s3client, 100, 1, bucket, obj, *out.UploadId)
+		if err != nil {
+			return err
+		}
+
+		compParts := []types.CompletedPart{}
+		for _, el := range parts {
+			compParts = append(compParts, types.CompletedPart{
+				ETag:       el.ETag,
+				PartNumber: el.PartNumber,
+			})
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:   &bucket,
+			Key:      &obj,
+			UploadId: out.UploadId,
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: compParts,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		resp, err := s3client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		expectedOutput := []types.Tag{
+			{
+				Key:   getPtr("key1"),
+				Value: getPtr("val1"),
+			},
+			{
+				Key:   getPtr("key2"),
+				Value: getPtr("val2"),
+			},
+		}
+
+		if !areTagsSame(resp.TagSet, expectedOutput) {
+			return fmt.Errorf("expected object tagging to be %v, instead got %v", expectedOutput, resp.TagSet)
 		}
 
 		return nil
@@ -3847,7 +6246,7 @@ func UploadPartCopy_incorrect_uploadId(s *S3Conf) error {
 		if err != nil {
 			return err
 		}
-		err = putObjects(s3client, []string{srcObj}, srcBucket)
+		_, err = putObjects(s3client, []string{srcObj}, srcBucket)
 		if err != nil {
 			return err
 		}
@@ -3888,7 +6287,7 @@ func UploadPartCopy_incorrect_object_key(s *S3Conf) error {
 		if err != nil {
 			return err
 		}
-		err = putObjects(s3client, []string{srcObj}, srcBucket)
+		_, err = putObjects(s3client, []string{srcObj}, srcBucket)
 		if err != nil {
 			return err
 		}
@@ -3934,7 +6333,7 @@ func UploadPartCopy_invalid_part_number(s *S3Conf) error {
 			PartNumber: &partNumber,
 		})
 		cancel()
-		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidPart)); err != nil {
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidPartNumber)); err != nil {
 			return err
 		}
 
@@ -4045,7 +6444,7 @@ func UploadPartCopy_success(s *S3Conf) error {
 			return err
 		}
 		objSize := 5 * 1024 * 1024
-		_, _, err = putObjectWithData(int64(objSize), &s3.PutObjectInput{
+		_, err = putObjectWithData(int64(objSize), &s3.PutObjectInput{
 			Bucket: &srcBucket,
 			Key:    &srcObj,
 		}, s3client)
@@ -4114,7 +6513,7 @@ func UploadPartCopy_by_range_invalid_range(s *S3Conf) error {
 			return err
 		}
 		objSize := 5 * 1024 * 1024
-		_, _, err = putObjectWithData(int64(objSize), &s3.PutObjectInput{
+		_, err = putObjectWithData(int64(objSize), &s3.PutObjectInput{
 			Bucket: &srcBucket,
 			Key:    &srcObj,
 		}, s3client)
@@ -4160,7 +6559,7 @@ func UploadPartCopy_greater_range_than_obj_size(s *S3Conf) error {
 			return err
 		}
 		srcObjSize := 5 * 1024 * 1024
-		_, _, err = putObjectWithData(int64(srcObjSize), &s3.PutObjectInput{
+		_, err = putObjectWithData(int64(srcObjSize), &s3.PutObjectInput{
 			Bucket: &srcBucket,
 			Key:    &srcObj,
 		}, s3client)
@@ -4184,7 +6583,7 @@ func UploadPartCopy_greater_range_than_obj_size(s *S3Conf) error {
 			PartNumber:      &partNumber,
 		})
 		cancel()
-		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidRange)); err != nil {
+		if err := checkApiErr(err, backend.CreateExceedingRangeErr(int64(srcObjSize))); err != nil {
 			return err
 		}
 
@@ -4206,7 +6605,7 @@ func UploadPartCopy_by_range_success(s *S3Conf) error {
 			return err
 		}
 		objSize := 5 * 1024 * 1024
-		_, _, err = putObjectWithData(int64(objSize), &s3.PutObjectInput{
+		_, err = putObjectWithData(int64(objSize), &s3.PutObjectInput{
 			Bucket: &srcBucket,
 			Key:    &srcObj,
 		}, s3client)
@@ -4309,8 +6708,8 @@ func ListParts_incorrect_object_key(s *S3Conf) error {
 	})
 }
 
-func ListParts_success(s *S3Conf) error {
-	testName := "ListParts_success"
+func ListParts_invalid_max_parts(s *S3Conf) error {
+	testName := "ListParts_invalid_max_parts"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj := "my-obj"
 		out, err := createMp(s3client, bucket, obj)
@@ -4318,7 +6717,28 @@ func ListParts_success(s *S3Conf) error {
 			return err
 		}
 
-		parts, err := uploadParts(s3client, 5*1024*1024, 5, bucket, obj, *out.UploadId)
+		invMaxParts := int32(-3)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.ListParts(ctx, &s3.ListPartsInput{
+			Bucket:   &bucket,
+			Key:      &obj,
+			UploadId: out.UploadId,
+			MaxParts: &invMaxParts,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidMaxParts)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func ListParts_default_max_parts(s *S3Conf) error {
+	testName := "ListParts_default_max_parts"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		out, err := createMp(s3client, bucket, obj)
 		if err != nil {
 			return err
 		}
@@ -4334,6 +6754,106 @@ func ListParts_success(s *S3Conf) error {
 			return err
 		}
 
+		if *res.MaxParts != 1000 {
+			return fmt.Errorf("expected max parts to be 1000, instead got %v", *res.MaxParts)
+		}
+
+		return nil
+	})
+}
+
+func ListParts_truncated(s *S3Conf) error {
+	testName := "ListParts_truncated"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		out, err := createMp(s3client, bucket, obj)
+		if err != nil {
+			return err
+		}
+
+		parts, _, err := uploadParts(s3client, 5*1024*1024, 5, bucket, obj, *out.UploadId)
+		if err != nil {
+			return err
+		}
+
+		maxParts := int32(3)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListParts(ctx, &s3.ListPartsInput{
+			Bucket:   &bucket,
+			Key:      &obj,
+			UploadId: out.UploadId,
+			MaxParts: &maxParts,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !*res.IsTruncated {
+			return fmt.Errorf("expected the result to be truncated")
+		}
+		if *res.MaxParts != maxParts {
+			return fmt.Errorf("expected max-parts to be %v, instead got %v", maxParts, *res.MaxParts)
+		}
+		if *res.NextPartNumberMarker != fmt.Sprint(*parts[2].PartNumber) {
+			return fmt.Errorf("expected next part number marker to be %v, instead got %v", fmt.Sprint(*parts[2].PartNumber), *res.NextPartNumberMarker)
+		}
+		if ok := compareParts(res.Parts, parts[:3]); !ok {
+			return fmt.Errorf("expected the parts data to be %v, instead got %v", parts[:3], res.Parts)
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		res2, err := s3client.ListParts(ctx, &s3.ListPartsInput{
+			Bucket:           &bucket,
+			Key:              &obj,
+			UploadId:         out.UploadId,
+			PartNumberMarker: res.NextPartNumberMarker,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *res2.PartNumberMarker != *res.NextPartNumberMarker {
+			return fmt.Errorf("expected part number marker to be %v, instead got %v", *res.NextPartNumberMarker, *res2.PartNumberMarker)
+		}
+		if ok := compareParts(parts[3:], res2.Parts); !ok {
+			return fmt.Errorf("expected the parts data to be %v, instead got %v", parts[3:], res2.Parts)
+		}
+
+		return nil
+	})
+}
+
+func ListParts_success(s *S3Conf) error {
+	testName := "ListParts_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		out, err := createMp(s3client, bucket, obj)
+		if err != nil {
+			return err
+		}
+
+		parts, _, err := uploadParts(s3client, 5*1024*1024, 5, bucket, obj, *out.UploadId)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListParts(ctx, &s3.ListPartsInput{
+			Bucket:   &bucket,
+			Key:      &obj,
+			UploadId: out.UploadId,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if res.StorageClass != types.StorageClassStandard {
+			return fmt.Errorf("expected the storage class to be %v, instead got %v", types.StorageClassStandard, res.StorageClass)
+		}
 		if ok := compareParts(parts, res.Parts); !ok {
 			return fmt.Errorf("expected parts %+v, instead got %+v", parts, res.Parts)
 		}
@@ -4380,15 +6900,15 @@ func ListMultipartUploads_empty_result(s *S3Conf) error {
 
 func ListMultipartUploads_invalid_max_uploads(s *S3Conf) error {
 	testName := "ListMultipartUploads_invalid_max_uploads"
-	maxUploads := int32(-3)
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		maxUploads := int32(-3)
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 		_, err := s3client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
 			Bucket:     &bucket,
 			MaxUploads: &maxUploads,
 		})
 		cancel()
-		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidMaxKeys)); err != nil {
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidMaxUploads)); err != nil {
 			return err
 		}
 
@@ -4405,7 +6925,11 @@ func ListMultipartUploads_max_uploads(s *S3Conf) error {
 			if err != nil {
 				return err
 			}
-			uploads = append(uploads, types.MultipartUpload{UploadId: out.UploadId, Key: out.Key})
+			uploads = append(uploads, types.MultipartUpload{
+				UploadId:     out.UploadId,
+				Key:          out.Key,
+				StorageClass: types.StorageClassStandard,
+			})
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 		maxUploads := int32(2)
@@ -4430,7 +6954,7 @@ func ListMultipartUploads_max_uploads(s *S3Conf) error {
 			return fmt.Errorf("expected next-key-marker to be %v, instead got %v", *uploads[1].Key, *out.NextKeyMarker)
 		}
 		if *out.NextUploadIdMarker != *uploads[1].UploadId {
-			return fmt.Errorf("expected next-upload-id-marker to be %v, instead got %v", *uploads[1].Key, *out.NextKeyMarker)
+			return fmt.Errorf("expected next-upload-id-marker to be %v, instead got %v", *uploads[1].UploadId, *out.NextUploadIdMarker)
 		}
 
 		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
@@ -4462,7 +6986,7 @@ func ListMultipartUploads_incorrect_next_key_marker(s *S3Conf) error {
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 		out, err := s3client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
 			Bucket:    &bucket,
-			KeyMarker: getPtr("incorrect_object_key"),
+			KeyMarker: getPtr("wrong_object_key"),
 		})
 		cancel()
 		if err != nil {
@@ -4486,7 +7010,11 @@ func ListMultipartUploads_ignore_upload_id_marker(s *S3Conf) error {
 			if err != nil {
 				return err
 			}
-			uploads = append(uploads, types.MultipartUpload{UploadId: out.UploadId, Key: out.Key})
+			uploads = append(uploads, types.MultipartUpload{
+				UploadId:     out.UploadId,
+				Key:          out.Key,
+				StorageClass: types.StorageClassStandard,
+			})
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 		out, err := s3client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
@@ -4506,7 +7034,7 @@ func ListMultipartUploads_ignore_upload_id_marker(s *S3Conf) error {
 }
 
 func ListMultipartUploads_success(s *S3Conf) error {
-	testName := "ListMultipartUploads_max_uploads"
+	testName := "ListMultipartUploads_success"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj1, obj2 := "my-obj-1", "my-obj-2"
 		out1, err := createMp(s3client, bucket, obj1)
@@ -4530,12 +7058,14 @@ func ListMultipartUploads_success(s *S3Conf) error {
 
 		expected := []types.MultipartUpload{
 			{
-				Key:      &obj1,
-				UploadId: out1.UploadId,
+				Key:          &obj1,
+				UploadId:     out1.UploadId,
+				StorageClass: types.StorageClassStandard,
 			},
 			{
-				Key:      &obj2,
-				UploadId: out2.UploadId,
+				Key:          &obj2,
+				UploadId:     out2.UploadId,
+				StorageClass: types.StorageClassStandard,
 			},
 		}
 
@@ -4656,7 +7186,7 @@ func AbortMultipartUpload_success_status_code(s *S3Conf) error {
 			return err
 		}
 
-		req, err := createSignedReq(http.MethodDelete, s.endpoint, fmt.Sprintf("%v/%v?uploadId=%v", bucket, obj, *out.UploadId), s.awsID, s.awsSecret, "s3", s.awsRegion, nil, time.Now())
+		req, err := createSignedReq(http.MethodDelete, s.endpoint, fmt.Sprintf("%v/%v?uploadId=%v", bucket, obj, *out.UploadId), s.awsID, s.awsSecret, "s3", s.awsRegion, nil, time.Now(), nil)
 		if err != nil {
 			return err
 		}
@@ -4794,8 +7324,8 @@ func CompleteMultipartUpload_success(s *S3Conf) error {
 			return err
 		}
 
-		objSize := 5 * 1024 * 1024
-		parts, err := uploadParts(s3client, objSize, 5, bucket, obj, *out.UploadId)
+		objSize := int64(5 * 1024 * 1024)
+		parts, csum, err := uploadParts(s3client, objSize, 5, bucket, obj, *out.UploadId)
 		if err != nil {
 			return err
 		}
@@ -4843,7 +7373,159 @@ func CompleteMultipartUpload_success(s *S3Conf) error {
 			return fmt.Errorf("expected the uploaded object size to be %v, instead got %v", objSize, resp.ContentLength)
 		}
 
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		defer cancel()
+		rget, err := s3client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		if err != nil {
+			return err
+		}
+
+		if *rget.ContentLength != int64(objSize) {
+			return fmt.Errorf("expected the object content-length to be %v, instead got %v", objSize, *rget.ContentLength)
+		}
+
+		bdy, err := io.ReadAll(rget.Body)
+		if err != nil {
+			return err
+		}
+		defer rget.Body.Close()
+
+		sum := sha256.Sum256(bdy)
+		getsum := hex.EncodeToString(sum[:])
+
+		if csum != getsum {
+			return fmt.Errorf("expected the object checksum to be %v, instead got %v", csum, getsum)
+		}
+
 		return nil
+	})
+}
+
+type mpinfo struct {
+	uploadId *string
+	parts    []types.CompletedPart
+}
+
+func CompleteMultipartUpload_racey_success(s *S3Conf) error {
+	testName := "CompleteMultipartUpload_racey_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+
+		var mu sync.RWMutex
+		uploads := make([]mpinfo, 10)
+		sums := make([]string, 10)
+		objSize := int64(5 * 1024 * 1024)
+
+		eg := errgroup.Group{}
+		for i := 0; i < 10; i++ {
+			func(i int) {
+				eg.Go(func() error {
+					out, err := createMp(s3client, bucket, obj)
+					if err != nil {
+						return err
+					}
+
+					parts, csum, err := uploadParts(s3client, objSize, 5, bucket, obj, *out.UploadId)
+					mu.Lock()
+					sums[i] = csum
+					mu.Unlock()
+					if err != nil {
+						return err
+					}
+
+					compParts := []types.CompletedPart{}
+					for _, el := range parts {
+						compParts = append(compParts, types.CompletedPart{
+							ETag:       el.ETag,
+							PartNumber: el.PartNumber,
+						})
+					}
+
+					mu.Lock()
+					uploads[i] = mpinfo{
+						uploadId: out.UploadId,
+						parts:    compParts,
+					}
+					mu.Unlock()
+					return nil
+				})
+			}(i)
+		}
+
+		err := eg.Wait()
+		if err != nil {
+			return err
+		}
+
+		eg = errgroup.Group{}
+		for i := 0; i < 10; i++ {
+			func(i int) {
+				eg.Go(func() error {
+					ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+					mu.RLock()
+					res, err := s3client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+						Bucket:   &bucket,
+						Key:      &obj,
+						UploadId: uploads[i].uploadId,
+						MultipartUpload: &types.CompletedMultipartUpload{
+							Parts: uploads[i].parts,
+						},
+					})
+					mu.RUnlock()
+					cancel()
+					if err != nil {
+						fmt.Println("GOT ERROR: ", err)
+						return err
+					}
+
+					if *res.Key != obj {
+						return fmt.Errorf("expected object key to be %v, instead got %v", obj, *res.Key)
+					}
+
+					return nil
+				})
+			}(i)
+		}
+
+		err = eg.Wait()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		defer cancel()
+		out, err := s3client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		if err != nil {
+			return err
+		}
+
+		if *out.ContentLength != int64(objSize) {
+			return fmt.Errorf("expected the object content-length to be %v, instead got %v", objSize, *out.ContentLength)
+		}
+
+		bdy, err := io.ReadAll(out.Body)
+		if err != nil {
+			return err
+		}
+		defer out.Body.Close()
+
+		sum := sha256.Sum256(bdy)
+		csum := hex.EncodeToString(sum[:])
+
+		mu.RLock()
+		defer mu.RUnlock()
+		for _, s := range sums {
+			if csum == s {
+				return nil
+			}
+		}
+		return fmt.Errorf("expected the object checksum to be one of %v, instead got %v", sums, csum)
 	})
 }
 
@@ -4863,6 +7545,38 @@ func PutBucketAcl_non_existing_bucket(s *S3Conf) error {
 	})
 }
 
+func PutBucketAcl_disabled(s *S3Conf) error {
+	testName := "PutBucketAcl_disabled"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketAcl(ctx, &s3.PutBucketAclInput{
+			Bucket:    &bucket,
+			ACL:       types.BucketCannedACLPublicRead,
+			GrantRead: &s.awsID,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrAclNotSupported)); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func PutBucketAcl_none_of_the_options_specified(s *S3Conf) error {
+	testName := "PutBucketAcl_none_of_the_options_specified"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketAcl(ctx, &s3.PutBucketAclInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMissingSecurityHeader)); err != nil {
+			return err
+		}
+		return nil
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
+}
+
 func PutBucketAcl_invalid_acl_canned_and_acp(s *S3Conf) error {
 	testName := "PutBucketAcl_invalid_acl_canned_and_acp"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
@@ -4873,12 +7587,12 @@ func PutBucketAcl_invalid_acl_canned_and_acp(s *S3Conf) error {
 			GrantRead: getPtr("user1"),
 		})
 		cancel()
-		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidRequest)); err != nil {
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrBothCannedAndHeaderGrants)); err != nil {
 			return err
 		}
 
 		return nil
-	})
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
 }
 
 func PutBucketAcl_invalid_acl_canned_and_grants(s *S3Conf) error {
@@ -4903,12 +7617,12 @@ func PutBucketAcl_invalid_acl_canned_and_grants(s *S3Conf) error {
 			},
 		})
 		cancel()
-		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidRequest)); err != nil {
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrUnexpectedContent)); err != nil {
 			return err
 		}
 
 		return nil
-	})
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
 }
 
 func PutBucketAcl_invalid_acl_acp_and_grants(s *S3Conf) error {
@@ -4933,25 +7647,41 @@ func PutBucketAcl_invalid_acl_acp_and_grants(s *S3Conf) error {
 			},
 		})
 		cancel()
-		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidRequest)); err != nil {
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrUnexpectedContent)); err != nil {
 			return err
 		}
 
 		return nil
-	})
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
 }
 
 func PutBucketAcl_invalid_owner(s *S3Conf) error {
-	testName := "PutBucketAcl_invalid_acl_acp_and_grants"
+	testName := "PutBucketAcl_invalid_owner"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		usr := user{
+			access: "grt1",
+			secret: "grt1secret",
+			role:   "user",
+		}
+
+		if err := createUsers(s, []user{usr}); err != nil {
+			return err
+		}
+
+		if err := changeBucketsOwner(s, []string{bucket}, usr.access); err != nil {
+			return err
+		}
+
+		userClient := getUserS3Client(usr, s)
+
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.PutBucketAcl(ctx, &s3.PutBucketAclInput{
+		_, err := userClient.PutBucketAcl(ctx, &s3.PutBucketAclInput{
 			Bucket: &bucket,
 			AccessControlPolicy: &types.AccessControlPolicy{
 				Grants: []types.Grant{
 					{
 						Grantee: &types.Grantee{
-							ID:   getPtr("awsID"),
+							ID:   getPtr(usr.access),
 							Type: types.TypeCanonicalUser,
 						},
 					},
@@ -4962,12 +7692,43 @@ func PutBucketAcl_invalid_owner(s *S3Conf) error {
 			},
 		})
 		cancel()
-		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrAccessDenied)); err != nil {
+		if err := checkApiErr(err, s3err.APIError{
+			Code:           "InvalidArgument",
+			Description:    "Invalid id",
+			HTTPStatusCode: http.StatusBadRequest,
+		}); err != nil {
 			return err
 		}
 
 		return nil
-	})
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
+}
+
+func PutBucketAcl_invalid_owner_not_in_body(s *S3Conf) error {
+	testName := "PutBucketAcl_invalid_owner_not_in_body"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketAcl(ctx, &s3.PutBucketAclInput{
+			Bucket: &bucket,
+			AccessControlPolicy: &types.AccessControlPolicy{
+				Grants: []types.Grant{
+					{
+						Grantee: &types.Grantee{
+							Type: types.TypeCanonicalUser,
+							ID:   getPtr("grt1"),
+						},
+						Permission: types.PermissionRead,
+					},
+				},
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMalformedACL)); err != nil {
+			return err
+		}
+
+		return nil
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
 }
 
 func PutBucketAcl_success_access_denied(s *S3Conf) error {
@@ -5006,13 +7767,13 @@ func PutBucketAcl_success_access_denied(s *S3Conf) error {
 		newConf.awsSecret = "grt1secret"
 		userClient := s3.NewFromConfig(newConf.Config())
 
-		err = putObjects(userClient, []string{"my-obj"}, bucket)
+		_, err = putObjects(userClient, []string{"my-obj"}, bucket)
 		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrAccessDenied)); err != nil {
 			return err
 		}
 
 		return nil
-	})
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
 }
 
 func PutBucketAcl_success_canned_acl(s *S3Conf) error {
@@ -5026,12 +7787,7 @@ func PutBucketAcl_success_canned_acl(s *S3Conf) error {
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 		_, err = s3client.PutBucketAcl(ctx, &s3.PutBucketAclInput{
 			Bucket: &bucket,
-			AccessControlPolicy: &types.AccessControlPolicy{
-				Owner: &types.Owner{
-					ID: &s.awsID,
-				},
-			},
-			ACL: types.BucketCannedACLPublicReadWrite,
+			ACL:    types.BucketCannedACLPublicReadWrite,
 		})
 		cancel()
 		if err != nil {
@@ -5043,13 +7799,13 @@ func PutBucketAcl_success_canned_acl(s *S3Conf) error {
 		newConf.awsSecret = "grt1secret"
 		userClient := s3.NewFromConfig(newConf.Config())
 
-		err = putObjects(userClient, []string{"my-obj"}, bucket)
+		_, err = putObjects(userClient, []string{"my-obj"}, bucket)
 		if err != nil {
 			return err
 		}
 
 		return nil
-	})
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
 }
 
 func PutBucketAcl_success_acp(s *S3Conf) error {
@@ -5062,12 +7818,7 @@ func PutBucketAcl_success_acp(s *S3Conf) error {
 
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 		_, err = s3client.PutBucketAcl(ctx, &s3.PutBucketAclInput{
-			Bucket: &bucket,
-			AccessControlPolicy: &types.AccessControlPolicy{
-				Owner: &types.Owner{
-					ID: &s.awsID,
-				},
-			},
+			Bucket:    &bucket,
 			GrantRead: getPtr("grt1"),
 		})
 		cancel()
@@ -5080,7 +7831,7 @@ func PutBucketAcl_success_acp(s *S3Conf) error {
 		newConf.awsSecret = "grt1secret"
 		userClient := s3.NewFromConfig(newConf.Config())
 
-		err = putObjects(userClient, []string{"my-obj"}, bucket)
+		_, err = putObjects(userClient, []string{"my-obj"}, bucket)
 		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrAccessDenied)); err != nil {
 			return err
 		}
@@ -5095,7 +7846,7 @@ func PutBucketAcl_success_acp(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
 }
 
 func PutBucketAcl_success_grants(s *S3Conf) error {
@@ -5134,13 +7885,13 @@ func PutBucketAcl_success_grants(s *S3Conf) error {
 		newConf.awsSecret = "grt1secret"
 		userClient := s3.NewFromConfig(newConf.Config())
 
-		err = putObjects(userClient, []string{"my-obj"}, bucket)
+		_, err = putObjects(userClient, []string{"my-obj"}, bucket)
 		if err != nil {
 			return err
 		}
 
 		return nil
-	})
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
 }
 
 func GetBucketAcl_non_existing_bucket(s *S3Conf) error {
@@ -5157,6 +7908,156 @@ func GetBucketAcl_non_existing_bucket(s *S3Conf) error {
 
 		return nil
 	})
+}
+
+func GetBucketAcl_translation_canned_public_read(s *S3Conf) error {
+	testName := "GetBucketAcl_translation_canned_public_read"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		grants := []types.Grant{
+			{
+				Grantee: &types.Grantee{
+					ID:   &s.awsID,
+					Type: types.TypeCanonicalUser,
+				},
+				Permission: types.PermissionFullControl,
+			},
+			{
+				Grantee: &types.Grantee{
+					ID:   getPtr("all-users"),
+					Type: types.TypeGroup,
+				},
+				Permission: types.PermissionRead,
+			},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketAcl(ctx, &s3.PutBucketAclInput{
+			Bucket: &bucket,
+			ACL:    types.BucketCannedACLPublicRead,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.GetBucketAcl(ctx, &s3.GetBucketAclInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if ok := compareGrants(out.Grants, grants); !ok {
+			return fmt.Errorf("expected grants to be %v, instead got %v", grants, out.Grants)
+		}
+		if *out.Owner.ID != s.awsID {
+			return fmt.Errorf("expected bucket owner to be %v, instead got %v", s.awsID, *out.Owner.ID)
+		}
+
+		return nil
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
+}
+
+func GetBucketAcl_translation_canned_public_read_write(s *S3Conf) error {
+	testName := "GetBucketAcl_translation_canned_public_read_write"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		grants := []types.Grant{
+			{
+				Grantee: &types.Grantee{
+					ID:   &s.awsID,
+					Type: types.TypeCanonicalUser,
+				},
+				Permission: types.PermissionFullControl,
+			},
+			{
+				Grantee: &types.Grantee{
+					ID:   getPtr("all-users"),
+					Type: types.TypeGroup,
+				},
+				Permission: types.PermissionRead,
+			},
+			{
+				Grantee: &types.Grantee{
+					ID:   getPtr("all-users"),
+					Type: types.TypeGroup,
+				},
+				Permission: types.PermissionWrite,
+			},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketAcl(ctx, &s3.PutBucketAclInput{
+			Bucket: &bucket,
+			ACL:    types.BucketCannedACLPublicReadWrite,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.GetBucketAcl(ctx, &s3.GetBucketAclInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if ok := compareGrants(out.Grants, grants); !ok {
+			return fmt.Errorf("expected grants to be %v, instead got %v", grants, out.Grants)
+		}
+		if *out.Owner.ID != s.awsID {
+			return fmt.Errorf("expected bucket owner to be %v, instead got %v", s.awsID, *out.Owner.ID)
+		}
+
+		return nil
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
+}
+
+func GetBucketAcl_translation_canned_private(s *S3Conf) error {
+	testName := "GetBucketAcl_translation_canned_private"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		grants := []types.Grant{
+			{
+				Grantee: &types.Grantee{
+					ID:   &s.awsID,
+					Type: types.TypeCanonicalUser,
+				},
+				Permission: types.PermissionFullControl,
+			},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketAcl(ctx, &s3.PutBucketAclInput{
+			Bucket: &bucket,
+			ACL:    types.BucketCannedACLPrivate,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.GetBucketAcl(ctx, &s3.GetBucketAclInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if ok := compareGrants(out.Grants, grants); !ok {
+			return fmt.Errorf("expected grants to be %v, instead got %v", grants, out.Grants)
+		}
+		if *out.Owner.ID != s.awsID {
+			return fmt.Errorf("expected bucket owner to be %v, instead got %v", s.awsID, *out.Owner.ID)
+		}
+
+		return nil
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
 }
 
 func GetBucketAcl_access_denied(s *S3Conf) error {
@@ -5245,6 +8146,16 @@ func GetBucketAcl_success(s *S3Conf) error {
 			return err
 		}
 
+		grants = append([]types.Grant{
+			{
+				Grantee: &types.Grantee{
+					ID:   &s.awsID,
+					Type: types.TypeCanonicalUser,
+				},
+				Permission: types.PermissionFullControl,
+			},
+		}, grants...)
+
 		if ok := compareGrants(out.Grants, grants); !ok {
 			return fmt.Errorf("expected grants to be %v, instead got %v", grants, out.Grants)
 		}
@@ -5253,7 +8164,7 @@ func GetBucketAcl_success(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
 }
 
 func PutBucketPolicy_non_existing_bucket(s *S3Conf) error {
@@ -5274,6 +8185,28 @@ func PutBucketPolicy_non_existing_bucket(s *S3Conf) error {
 	})
 }
 
+func PutBucketPolicy_empty_statement(s *S3Conf) error {
+	testName := "PutBucketPolicy_empty_statement"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		doc := `
+		{
+			"Statement": []
+		}
+		`
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+			Bucket: &bucket,
+			Policy: &doc,
+		})
+		cancel()
+		if err := checkApiErr(err, getMalformedPolicyError("Could not parse the policy: Statement is empty!")); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 func PutBucketPolicy_invalid_effect(s *S3Conf) error {
 	testName := "PutBucketPolicy_invalid_effect"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
@@ -5286,7 +8219,7 @@ func PutBucketPolicy_invalid_effect(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError("invalid effect: invalid_effect")); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Invalid effect: invalid_effect")); err != nil {
 			return err
 		}
 		return nil
@@ -5305,7 +8238,7 @@ func PutBucketPolicy_empty_actions_string(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError("actions can't be empty")); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Policy has invalid action")); err != nil {
 			return err
 		}
 		return nil
@@ -5324,7 +8257,7 @@ func PutBucketPolicy_empty_actions_array(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError("actions can't be empty")); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Policy has invalid action")); err != nil {
 			return err
 		}
 		return nil
@@ -5343,7 +8276,7 @@ func PutBucketPolicy_invalid_action(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError("invalid action: ListObjects")); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Policy has invalid action")); err != nil {
 			return err
 		}
 		return nil
@@ -5362,7 +8295,7 @@ func PutBucketPolicy_unsupported_action(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError("unsupported action: s3:PutLifecycleConfiguration")); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Policy has invalid action")); err != nil {
 			return err
 		}
 		return nil
@@ -5381,7 +8314,7 @@ func PutBucketPolicy_incorrect_action_wildcard_usage(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError("invalid wildcard usage: s3:hello prefix is not in the supported actions list")); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Policy has invalid action")); err != nil {
 			return err
 		}
 		return nil
@@ -5400,7 +8333,7 @@ func PutBucketPolicy_empty_principals_string(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError("principals can't be empty")); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Invalid principal in policy")); err != nil {
 			return err
 		}
 		return nil
@@ -5419,7 +8352,45 @@ func PutBucketPolicy_empty_principals_array(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError("principals can't be empty")); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Invalid principal in policy")); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func PutBucketPolicy_principals_aws_struct_empty_string(s *S3Conf) error {
+	testName := "PutBucketPolicy_principals_aws_struct_empty_string"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		doc := genPolicyDoc("Allow", `{"AWS": ""}`, `"s3:*"`, `"arn:aws:s3:::*"`)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+			Bucket: &bucket,
+			Policy: &doc,
+		})
+		cancel()
+
+		if err := checkApiErr(err, getMalformedPolicyError("Invalid principal in policy")); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func PutBucketPolicy_principals_aws_struct_empty_string_slice(s *S3Conf) error {
+	testName := "PutBucketPolicy_principals_aws_struct_empty_string_slice"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		doc := genPolicyDoc("Allow", `{"AWS": []}`, `"s3:*"`, `"arn:aws:s3:::*"`)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+			Bucket: &bucket,
+			Policy: &doc,
+		})
+		cancel()
+
+		if err := checkApiErr(err, getMalformedPolicyError("Invalid principal in policy")); err != nil {
 			return err
 		}
 		return nil
@@ -5438,7 +8409,7 @@ func PutBucketPolicy_principals_incorrect_wildcard_usage(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError("principals should either contain * or user access keys")); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Invalid principal in policy")); err != nil {
 			return err
 		}
 		return nil
@@ -5457,14 +8428,8 @@ func PutBucketPolicy_non_existing_principals(s *S3Conf) error {
 		})
 		cancel()
 
-		apiErr1 := getMalformedPolicyError(fmt.Sprintf("user accounts don't exist: %v", []string{"a_rarely_existing_user_account_1", "a_rarely_existing_user_account_2"}))
-		apiErr2 := getMalformedPolicyError(fmt.Sprintf("user accounts don't exist: %v", []string{"a_rarely_existing_user_account_2", "a_rarely_existing_user_account_1"}))
-
-		err1 := checkApiErr(err, apiErr1)
-		err2 := checkApiErr(err, apiErr2)
-
-		if err1 != nil && err2 != nil {
-			return err1
+		if err := checkApiErr(err, getMalformedPolicyError("Invalid principal in policy")); err != nil {
+			return err
 		}
 
 		return nil
@@ -5483,7 +8448,7 @@ func PutBucketPolicy_empty_resources_string(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError("resources can't be empty")); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Policy has invalid resource")); err != nil {
 			return err
 		}
 		return nil
@@ -5502,7 +8467,7 @@ func PutBucketPolicy_empty_resources_array(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError("resources can't be empty")); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Policy has invalid resource")); err != nil {
 			return err
 		}
 		return nil
@@ -5522,7 +8487,7 @@ func PutBucketPolicy_invalid_resource_prefix(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError(fmt.Sprintf("invalid resource: %v", resource[1:len(resource)-1]))); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Policy has invalid resource")); err != nil {
 			return err
 		}
 		return nil
@@ -5542,7 +8507,7 @@ func PutBucketPolicy_invalid_resource_with_starting_slash(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError(fmt.Sprintf("invalid resource: %v", resource[1:len(resource)-1]))); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Policy has invalid resource")); err != nil {
 			return err
 		}
 		return nil
@@ -5561,10 +8526,10 @@ func PutBucketPolicy_duplicate_resource(s *S3Conf) error {
 			Policy: &doc,
 		})
 		cancel()
-
-		if err := checkApiErr(err, getMalformedPolicyError(fmt.Sprintf("duplicate resource: %v", resource[1:len(resource)-1]))); err != nil {
+		if err != nil {
 			return err
 		}
+
 		return nil
 	})
 }
@@ -5582,7 +8547,7 @@ func PutBucketPolicy_incorrect_bucket_name(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError(fmt.Sprintf("incorrect bucket name in prefix-%v", bucket))); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Policy has invalid resource")); err != nil {
 			return err
 		}
 		return nil
@@ -5602,7 +8567,7 @@ func PutBucketPolicy_object_action_on_bucket_resource(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError("unsupported object action 's3:PutObjectTagging' on the specified resources")); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Action does not apply to any resource(s) in statement")); err != nil {
 			return err
 		}
 		return nil
@@ -5622,7 +8587,7 @@ func PutBucketPolicy_bucket_action_on_object_resource(s *S3Conf) error {
 		})
 		cancel()
 
-		if err := checkApiErr(err, getMalformedPolicyError("unsupported bucket action 's3:DeleteBucket' on the specified resources")); err != nil {
+		if err := checkApiErr(err, getMalformedPolicyError("Action does not apply to any resource(s) in statement")); err != nil {
 			return err
 		}
 		return nil
@@ -5645,7 +8610,9 @@ func PutBucketPolicy_success(s *S3Conf) error {
 
 		for _, doc := range []string{
 			genPolicyDoc("Allow", `["grt1", "grt2"]`, `["s3:DeleteBucket", "s3:GetBucketAcl"]`, bucketResource),
+			genPolicyDoc("Allow", `{"AWS": ["grt1", "grt2"]}`, `["s3:DeleteBucket", "s3:GetBucketAcl"]`, bucketResource),
 			genPolicyDoc("Deny", `"*"`, `"s3:DeleteBucket"`, fmt.Sprintf(`"arn:aws:s3:::%v"`, bucket)),
+			genPolicyDoc("Deny", `{"AWS": "*"}`, `"s3:DeleteBucket"`, fmt.Sprintf(`"arn:aws:s3:::%v"`, bucket)),
 			genPolicyDoc("Allow", `"grt1"`, `["s3:PutBucketVersioning", "s3:ListMultipartUploadParts", "s3:ListBucket"]`, fmt.Sprintf(`[%v, %v]`, bucketResource, objectResource)),
 			genPolicyDoc("Allow", `"*"`, `"s3:*"`, fmt.Sprintf(`[%v, %v]`, bucketResource, objectResource)),
 			genPolicyDoc("Allow", `"*"`, `"s3:Get*"`, objectResource),
@@ -5682,20 +8649,16 @@ func GetBucketPolicy_non_existing_bucket(s *S3Conf) error {
 	})
 }
 
-func GetBucketPolicy_default_empty_policy(s *S3Conf) error {
-	testName := "GetBucketPolicy_default_empty_policy"
+func GetBucketPolicy_not_set(s *S3Conf) error {
+	testName := "GetBucketPolicy_not_set"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		out, err := s3client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{
+		_, err := s3client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{
 			Bucket: &bucket,
 		})
 		cancel()
-		if err != nil {
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchBucketPolicy)); err != nil {
 			return err
-		}
-
-		if out.Policy != nil {
-			return fmt.Errorf("expected policy to be nil, instead got %s", *out.Policy)
 		}
 
 		return nil
@@ -5789,19 +8752,15 @@ func DeleteBucketPolicy_success(s *S3Conf) error {
 		}
 
 		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
-		out, err := s3client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{
+		_, err = s3client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{
 			Bucket: &bucket,
 		})
 		cancel()
-		if err != nil {
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchBucketPolicy)); err != nil {
 			return err
 		}
 
-		if out.Policy != nil {
-			return fmt.Errorf("expected policy to be nil, instead got %s", *out.Policy)
-		}
-
-		return err
+		return nil
 	})
 }
 
@@ -5830,7 +8789,81 @@ func PutObjectLockConfiguration_empty_config(s *S3Conf) error {
 			Bucket: &bucket,
 		})
 		cancel()
-		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidRequest)); err != nil {
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMalformedXML)); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func PutObjectLockConfiguration_not_enabled_on_bucket_creation(s *S3Conf) error {
+	testName := "PutObjectLockConfiguration_not_enabled_on_bucket_creation"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		var days int32 = 12
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObjectLockConfiguration(ctx, &s3.PutObjectLockConfigurationInput{
+			Bucket: &bucket,
+			ObjectLockConfiguration: &types.ObjectLockConfiguration{
+				ObjectLockEnabled: types.ObjectLockEnabledEnabled,
+				Rule: &types.ObjectLockRule{
+					DefaultRetention: &types.DefaultRetention{
+						Days: &days,
+						Mode: types.ObjectLockRetentionModeCompliance,
+					},
+				},
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotAllowed)); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func PutObjectLockConfiguration_invalid_status(s *S3Conf) error {
+	testName := "PutObjectLockConfiguration_invalid_status"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		var days int32 = 12
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObjectLockConfiguration(ctx, &s3.PutObjectLockConfigurationInput{
+			Bucket: &bucket,
+			ObjectLockConfiguration: &types.ObjectLockConfiguration{
+				ObjectLockEnabled: types.ObjectLockEnabled("invalid_status"),
+				Rule: &types.ObjectLockRule{
+					DefaultRetention: &types.DefaultRetention{
+						Days: &days,
+					},
+				},
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMalformedXML)); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func PutObjectLockConfiguration_invalid_mode(s *S3Conf) error {
+	testName := "PutObjectLockConfiguration_invalid_status"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		var days int32 = 12
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObjectLockConfiguration(ctx, &s3.PutObjectLockConfigurationInput{
+			Bucket: &bucket,
+			ObjectLockConfiguration: &types.ObjectLockConfiguration{
+				ObjectLockEnabled: types.ObjectLockEnabledEnabled,
+				Rule: &types.ObjectLockRule{
+					DefaultRetention: &types.DefaultRetention{
+						Days: &days,
+						Mode: types.ObjectLockRetentionMode("invalid_mode"),
+					},
+				},
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMalformedXML)); err != nil {
 			return err
 		}
 		return nil
@@ -5855,9 +8888,52 @@ func PutObjectLockConfiguration_both_years_and_days(s *S3Conf) error {
 			},
 		})
 		cancel()
-		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidRequest)); err != nil {
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMalformedXML)); err != nil {
 			return err
 		}
+		return nil
+	})
+}
+
+func PutObjectLockConfiguration_invalid_years_days(s *S3Conf) error {
+	testName := "PutObjectLockConfiguration_invalid_years"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		var days, years int32 = -3, -5
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObjectLockConfiguration(ctx, &s3.PutObjectLockConfigurationInput{
+			Bucket: &bucket,
+			ObjectLockConfiguration: &types.ObjectLockConfiguration{
+				ObjectLockEnabled: types.ObjectLockEnabledEnabled,
+				Rule: &types.ObjectLockRule{
+					DefaultRetention: &types.DefaultRetention{
+						Days: &days,
+						Mode: types.ObjectLockRetentionModeCompliance,
+					},
+				},
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLockInvalidRetentionPeriod)); err != nil {
+			return err
+		}
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectLockConfiguration(ctx, &s3.PutObjectLockConfigurationInput{
+			Bucket: &bucket,
+			ObjectLockConfiguration: &types.ObjectLockConfiguration{
+				ObjectLockEnabled: types.ObjectLockEnabledEnabled,
+				Rule: &types.ObjectLockRule{
+					DefaultRetention: &types.DefaultRetention{
+						Years: &years,
+						Mode:  types.ObjectLockRetentionModeCompliance,
+					},
+				},
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLockInvalidRetentionPeriod)); err != nil {
+			return err
+		}
+
 		return nil
 	})
 }
@@ -5877,7 +8953,7 @@ func PutObjectLockConfiguration_success(s *S3Conf) error {
 			return err
 		}
 		return nil
-	})
+	}, withLock())
 }
 
 func GetObjectLockConfiguration_non_existing_bucket(s *S3Conf) error {
@@ -5961,7 +9037,7 @@ func GetObjectLockConfiguration_success(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
 func PutObjectRetention_non_existing_bucket(s *S3Conf) error {
@@ -6004,7 +9080,7 @@ func PutObjectRetention_non_existing_object(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
 func PutObjectRetention_unset_bucket_object_lock_config(s *S3Conf) error {
@@ -6013,12 +9089,13 @@ func PutObjectRetention_unset_bucket_object_lock_config(s *S3Conf) error {
 		date := time.Now().Add(time.Hour * 3)
 		key := "my-obj"
 
-		if err := putObjects(s3client, []string{key}, bucket); err != nil {
+		_, err := putObjects(s3client, []string{key}, bucket)
+		if err != nil {
 			return err
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
 			Bucket: &bucket,
 			Key:    &key,
 			Retention: &types.ObjectLockRetention{
@@ -6051,7 +9128,8 @@ func PutObjectRetention_disabled_bucket_object_lock_config(s *S3Conf) error {
 		date := time.Now().Add(time.Hour * 3)
 		key := "my-obj"
 
-		if err := putObjects(s3client, []string{key}, bucket); err != nil {
+		_, err = putObjects(s3client, []string{key}, bucket)
+		if err != nil {
 			return err
 		}
 
@@ -6070,7 +9148,7 @@ func PutObjectRetention_disabled_bucket_object_lock_config(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
 func PutObjectRetention_expired_retain_until_date(s *S3Conf) error {
@@ -6097,7 +9175,181 @@ func PutObjectRetention_expired_retain_until_date(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
+}
+
+func PutObjectRetention_invalid_mode(s *S3Conf) error {
+	testName := "PutObjectRetention_invalid_mode"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		date := time.Now().Add(time.Hour * 3)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+			Bucket: &bucket,
+			Key:    getPtr("my-obj"),
+			Retention: &types.ObjectLockRetention{
+				Mode:            types.ObjectLockRetentionMode("invalid_mode"),
+				RetainUntilDate: &date,
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMalformedXML)); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock())
+}
+
+func PutObjectRetention_overwrite_compliance_mode(s *S3Conf) error {
+	testName := "PutObjectRetention_overwrite_compliance_mode"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		date := time.Now().Add(time.Hour * 3)
+		obj := "my-obj"
+		_, err := putObjects(s3client, []string{obj}, bucket)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+			Bucket: &bucket,
+			Key:    &obj,
+			Retention: &types.ObjectLockRetention{
+				Mode:            types.ObjectLockRetentionModeCompliance,
+				RetainUntilDate: &date,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+			Bucket: &bucket,
+			Key:    &obj,
+			Retention: &types.ObjectLockRetention{
+				Mode:            types.ObjectLockRetentionModeGovernance,
+				RetainUntilDate: &date,
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMethodNotAllowed)); err != nil {
+			return err
+		}
+
+		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock())
+}
+
+func PutObjectRetention_overwrite_governance_without_bypass_specified(s *S3Conf) error {
+	testName := "PutObjectRetention_overwrite_governance_without_bypass_specified"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		date := time.Now().Add(time.Hour * 3)
+		obj := "my-obj"
+		_, err := putObjects(s3client, []string{obj}, bucket)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+			Bucket: &bucket,
+			Key:    &obj,
+			Retention: &types.ObjectLockRetention{
+				Mode:            types.ObjectLockRetentionModeGovernance,
+				RetainUntilDate: &date,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+			Bucket: &bucket,
+			Key:    &obj,
+			Retention: &types.ObjectLockRetention{
+				Mode:            types.ObjectLockRetentionModeCompliance,
+				RetainUntilDate: &date,
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMethodNotAllowed)); err != nil {
+			return err
+		}
+
+		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock())
+}
+
+func PutObjectRetention_overwrite_governance_with_permission(s *S3Conf) error {
+	testName := "PutObjectRetention_overwrite_governance_with_permission"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		date := time.Now().Add(time.Hour * 3)
+		obj := "my-obj"
+		_, err := putObjects(s3client, []string{obj}, bucket)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+			Bucket: &bucket,
+			Key:    &obj,
+			Retention: &types.ObjectLockRetention{
+				Mode:            types.ObjectLockRetentionModeGovernance,
+				RetainUntilDate: &date,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		policy := genPolicyDoc("Allow", `"*"`, `["s3:BypassGovernanceRetention"]`, fmt.Sprintf(`"arn:aws:s3:::%v/*"`, bucket))
+		bypass := true
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+			Bucket: &bucket,
+			Policy: &policy,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+			Bucket: &bucket,
+			Key:    &obj,
+			Retention: &types.ObjectLockRetention{
+				Mode:            types.ObjectLockRetentionModeCompliance,
+				RetainUntilDate: &date,
+			},
+			BypassGovernanceRetention: &bypass,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock())
 }
 
 func PutObjectRetention_success(s *S3Conf) error {
@@ -6110,12 +9362,13 @@ func PutObjectRetention_success(s *S3Conf) error {
 		date := time.Now().Add(time.Hour * 3)
 		key := "my-obj"
 
-		if err := putObjects(s3client, []string{key}, bucket); err != nil {
+		_, err := putObjects(s3client, []string{key}, bucket)
+		if err != nil {
 			return err
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
 			Bucket: &bucket,
 			Key:    &key,
 			Retention: &types.ObjectLockRetention{
@@ -6133,7 +9386,7 @@ func PutObjectRetention_success(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
 func GetObjectRetention_non_existing_bucket(s *S3Conf) error {
@@ -6170,16 +9423,40 @@ func GetObjectRetention_non_existing_object(s *S3Conf) error {
 	})
 }
 
-func GetObjectRetention_unset_config(s *S3Conf) error {
-	testName := "GetObjectRetention_unset_config"
+func GetObjectRetention_disabled_lock(s *S3Conf) error {
+	testName := "GetObjectRetention_disabled_lock"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		key := "my-obj"
-		if err := putObjects(s3client, []string{key}, bucket); err != nil {
+		_, err := putObjects(s3client, []string{key}, bucket)
+		if err != nil {
 			return err
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.GetObjectRetention(ctx, &s3.GetObjectRetentionInput{
+		_, err = s3client.GetObjectRetention(ctx, &s3.GetObjectRetentionInput{
+			Bucket: &bucket,
+			Key:    &key,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidBucketObjectLockConfiguration)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func GetObjectRetention_unset_config(s *S3Conf) error {
+	testName := "GetObjectRetention_unset_config"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		key := "my-obj"
+		_, err := putObjects(s3client, []string{key}, bucket)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObjectRetention(ctx, &s3.GetObjectRetentionInput{
 			Bucket: &bucket,
 			Key:    &key,
 		})
@@ -6189,7 +9466,7 @@ func GetObjectRetention_unset_config(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
 func GetObjectRetention_success(s *S3Conf) error {
@@ -6199,7 +9476,8 @@ func GetObjectRetention_success(s *S3Conf) error {
 			return err
 		}
 		key := "my-obj"
-		if err := putObjects(s3client, []string{key}, bucket); err != nil {
+		_, err := putObjects(s3client, []string{key}, bucket)
+		if err != nil {
 			return err
 		}
 
@@ -6210,7 +9488,7 @@ func GetObjectRetention_success(s *S3Conf) error {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
 			Bucket:    &bucket,
 			Key:       &key,
 			Retention: &retention,
@@ -6249,7 +9527,7 @@ func GetObjectRetention_success(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
 func PutObjectLegalHold_non_existing_bucket(s *S3Conf) error {
@@ -6290,7 +9568,7 @@ func PutObjectLegalHold_non_existing_object(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
 func PutObjectLegalHold_invalid_body(s *S3Conf) error {
@@ -6310,17 +9588,38 @@ func PutObjectLegalHold_invalid_body(s *S3Conf) error {
 	})
 }
 
+func PutObjectLegalHold_invalid_status(s *S3Conf) error {
+	testName := "PutObjectLegalHold_invalid_status"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
+			Bucket: &bucket,
+			Key:    getPtr("my-obj"),
+			LegalHold: &types.ObjectLockLegalHold{
+				Status: types.ObjectLockLegalHoldStatus("invalid_status"),
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMalformedXML)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
 func PutObjectLegalHold_unset_bucket_object_lock_config(s *S3Conf) error {
 	testName := "PutObjectLegalHold_unset_bucket_object_lock_config"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		key := "my-obj"
 
-		if err := putObjects(s3client, []string{key}, bucket); err != nil {
+		_, err := putObjects(s3client, []string{key}, bucket)
+		if err != nil {
 			return err
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
+		_, err = s3client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
 			Bucket: &bucket,
 			Key:    &key,
 			LegalHold: &types.ObjectLockLegalHold{
@@ -6351,7 +9650,8 @@ func PutObjectLegalHold_disabled_bucket_object_lock_config(s *S3Conf) error {
 
 		key := "my-obj"
 
-		if err := putObjects(s3client, []string{key}, bucket); err != nil {
+		_, err = putObjects(s3client, []string{key}, bucket)
+		if err != nil {
 			return err
 		}
 
@@ -6369,7 +9669,7 @@ func PutObjectLegalHold_disabled_bucket_object_lock_config(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
 func PutObjectLegalHold_success(s *S3Conf) error {
@@ -6381,12 +9681,13 @@ func PutObjectLegalHold_success(s *S3Conf) error {
 
 		key := "my-obj"
 
-		if err := putObjects(s3client, []string{key}, bucket); err != nil {
+		_, err := putObjects(s3client, []string{key}, bucket)
+		if err != nil {
 			return err
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
+		_, err = s3client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
 			Bucket: &bucket,
 			Key:    &key,
 			LegalHold: &types.ObjectLockLegalHold{
@@ -6403,7 +9704,7 @@ func PutObjectLegalHold_success(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
 func GetObjectLegalHold_non_existing_bucket(s *S3Conf) error {
@@ -6440,16 +9741,40 @@ func GetObjectLegalHold_non_existing_object(s *S3Conf) error {
 	})
 }
 
-func GetObjectLegalHold_unset_config(s *S3Conf) error {
-	testName := "GetObjectLegalHold_unset_config"
+func GetObjectLegalHold_disabled_lock(s *S3Conf) error {
+	testName := "GetObjectLegalHold_disabled_lock"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		key := "my-obj"
-		if err := putObjects(s3client, []string{key}, bucket); err != nil {
+		_, err := putObjects(s3client, []string{key}, bucket)
+		if err != nil {
 			return err
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.GetObjectLegalHold(ctx, &s3.GetObjectLegalHoldInput{
+		_, err = s3client.GetObjectLegalHold(ctx, &s3.GetObjectLegalHoldInput{
+			Bucket: &bucket,
+			Key:    &key,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidBucketObjectLockConfiguration)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func GetObjectLegalHold_unset_config(s *S3Conf) error {
+	testName := "GetObjectLegalHold_unset_config"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		key := "my-obj"
+		_, err := putObjects(s3client, []string{key}, bucket)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObjectLegalHold(ctx, &s3.GetObjectLegalHoldInput{
 			Bucket: &bucket,
 			Key:    &key,
 		})
@@ -6459,7 +9784,7 @@ func GetObjectLegalHold_unset_config(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
 func GetObjectLegalHold_success(s *S3Conf) error {
@@ -6469,12 +9794,13 @@ func GetObjectLegalHold_success(s *S3Conf) error {
 			return err
 		}
 		key := "my-obj"
-		if err := putObjects(s3client, []string{key}, bucket); err != nil {
+		_, err := putObjects(s3client, []string{key}, bucket)
+		if err != nil {
 			return err
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
+		_, err = s3client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
 			Bucket: &bucket,
 			Key:    &key,
 			LegalHold: &types.ObjectLockLegalHold{
@@ -6505,7 +9831,7 @@ func GetObjectLegalHold_success(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
 func WORMProtection_bucket_object_lock_configuration_compliance_mode(s *S3Conf) error {
@@ -6531,7 +9857,8 @@ func WORMProtection_bucket_object_lock_configuration_compliance_mode(s *S3Conf) 
 			return err
 		}
 
-		if err := putObjects(s3client, []string{object}, bucket); err != nil {
+		_, err = putObjects(s3client, []string{object}, bucket)
+		if err != nil {
 			return err
 		}
 
@@ -6543,11 +9870,11 @@ func WORMProtection_bucket_object_lock_configuration_compliance_mode(s *S3Conf) 
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
-func WORMProtection_bucket_object_lock_governance_root_overwrite(s *S3Conf) error {
-	testName := "WORMProtection_bucket_object_lock_governance_root_overwrite"
+func WORMProtection_bucket_object_lock_configuration_governance_mode(s *S3Conf) error {
+	testName := "WORMProtection_bucket_object_lock_configuration_governance_mode"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		var days int32 = 10
 		object := "my-obj"
@@ -6569,13 +9896,71 @@ func WORMProtection_bucket_object_lock_governance_root_overwrite(s *S3Conf) erro
 			return err
 		}
 
-		// create an object
-		if err := putObjects(s3client, []string{object}, bucket); err != nil {
+		_, err = putObjects(s3client, []string{object}, bucket)
+		if err != nil {
 			return err
 		}
 
-		// overwrite the object
-		if err := putObjects(s3client, []string{object}, bucket); err != nil {
+		if err := checkWORMProtection(s3client, bucket, object); err != nil {
+			return err
+		}
+		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock())
+}
+
+func WORMProtection_bucket_object_lock_governance_bypass_delete(s *S3Conf) error {
+	testName := "WORMProtection_bucket_object_lock_governance_bypass_delete"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		var days int32 = 10
+		object := "my-obj"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObjectLockConfiguration(ctx, &s3.PutObjectLockConfigurationInput{
+			Bucket: &bucket,
+			ObjectLockConfiguration: &types.ObjectLockConfiguration{
+				ObjectLockEnabled: types.ObjectLockEnabledEnabled,
+				Rule: &types.ObjectLockRule{
+					DefaultRetention: &types.DefaultRetention{
+						Mode: types.ObjectLockRetentionModeGovernance,
+						Days: &days,
+					},
+				},
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		_, err = putObjects(s3client, []string{object}, bucket)
+		if err != nil {
+			return err
+		}
+
+		policy := genPolicyDoc("Allow", `"*"`, `["s3:BypassGovernanceRetention"]`, fmt.Sprintf(`"arn:aws:s3:::%v/*"`, bucket))
+		bypass := true
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+			Bucket: &bucket,
+			Policy: &policy,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket:                    &bucket,
+			Key:                       &object,
+			BypassGovernanceRetention: &bypass,
+		})
+		cancel()
+		if err != nil {
 			return err
 		}
 
@@ -6584,25 +9969,94 @@ func WORMProtection_bucket_object_lock_governance_root_overwrite(s *S3Conf) erro
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
-func WORMProtection_object_lock_retention_compliance_root_access_denied(s *S3Conf) error {
-	testName := "WORMProtection_object_lock_retention_compliance_root_access_denied"
+func WORMProtection_bucket_object_lock_governance_bypass_delete_multiple(s *S3Conf) error {
+	testName := "WORMProtection_bucket_object_lock_governance_bypass_delete_multiple"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		if err := changeBucketObjectLockStatus(s3client, bucket, true); err != nil {
+		var days int32 = 10
+		obj1, obj2, obj3 := "my-obj-1", "my-obj-2", "my-obj-3"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObjectLockConfiguration(ctx, &s3.PutObjectLockConfigurationInput{
+			Bucket: &bucket,
+			ObjectLockConfiguration: &types.ObjectLockConfiguration{
+				ObjectLockEnabled: types.ObjectLockEnabledEnabled,
+				Rule: &types.ObjectLockRule{
+					DefaultRetention: &types.DefaultRetention{
+						Mode: types.ObjectLockRetentionModeGovernance,
+						Days: &days,
+					},
+				},
+			},
+		})
+		cancel()
+		if err != nil {
 			return err
 		}
 
+		_, err = putObjects(s3client, []string{obj1, obj2, obj3}, bucket)
+		if err != nil {
+			return err
+		}
+
+		policy := genPolicyDoc("Allow", `"*"`, `["s3:BypassGovernanceRetention"]`, fmt.Sprintf(`"arn:aws:s3:::%v/*"`, bucket))
+		bypass := true
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+			Bucket: &bucket,
+			Policy: &policy,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket:                    &bucket,
+			BypassGovernanceRetention: &bypass,
+			Delete: &types.Delete{
+				Objects: []types.ObjectIdentifier{
+					{
+						Key: &obj1,
+					},
+					{
+						Key: &obj2,
+					},
+					{
+						Key: &obj3,
+					},
+				},
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock())
+}
+
+func WORMProtection_object_lock_retention_compliance_locked(s *S3Conf) error {
+	testName := "WORMProtection_object_lock_retention_compliance_locked"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		object := "my-obj"
 
-		if err := putObjects(s3client, []string{object}, bucket); err != nil {
+		_, err := putObjects(s3client, []string{object}, bucket)
+		if err != nil {
 			return err
 		}
 
 		date := time.Now().Add(time.Hour * 3)
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
 			Bucket: &bucket,
 			Key:    &object,
 			Retention: &types.ObjectLockRetention{
@@ -6623,25 +10077,22 @@ func WORMProtection_object_lock_retention_compliance_root_access_denied(s *S3Con
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
-func WORMProtection_object_lock_retention_governance_root_overwrite(s *S3Conf) error {
-	testName := "WORMProtection_object_lock_retention_governance_root_overwrite"
+func WORMProtection_object_lock_retention_governance_locked(s *S3Conf) error {
+	testName := "WORMProtection_object_lock_retention_governance_locked"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		if err := changeBucketObjectLockStatus(s3client, bucket, true); err != nil {
-			return err
-		}
-
 		object := "my-obj"
 
-		if err := putObjects(s3client, []string{object}, bucket); err != nil {
+		_, err := putObjects(s3client, []string{object}, bucket)
+		if err != nil {
 			return err
 		}
 
 		date := time.Now().Add(time.Hour * 3)
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
 			Bucket: &bucket,
 			Key:    &object,
 			Retention: &types.ObjectLockRetention{
@@ -6654,34 +10105,30 @@ func WORMProtection_object_lock_retention_governance_root_overwrite(s *S3Conf) e
 			return err
 		}
 
-		if err := putObjects(s3client, []string{object}, bucket); err != nil {
+		if err := checkWORMProtection(s3client, bucket, object); err != nil {
 			return err
 		}
-
 		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
 			return err
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
-func WORMProtection_object_lock_retention_governance_user_access_denied(s *S3Conf) error {
-	testName := "WORMProtection_object_lock_retention_governance_user_access_denied"
+func WORMProtection_object_lock_retention_governance_bypass_overwrite(s *S3Conf) error {
+	testName := "WORMProtection_object_lock_retention_governance_bypass_overwrite"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		if err := changeBucketObjectLockStatus(s3client, bucket, true); err != nil {
-			return err
-		}
-
 		object := "my-obj"
 
-		if err := putObjects(s3client, []string{object}, bucket); err != nil {
+		_, err := putObjects(s3client, []string{object}, bucket)
+		if err != nil {
 			return err
 		}
 
 		date := time.Now().Add(time.Hour * 3)
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
 			Bucket: &bucket,
 			Key:    &object,
 			Retention: &types.ObjectLockRetention{
@@ -6694,24 +10141,25 @@ func WORMProtection_object_lock_retention_governance_user_access_denied(s *S3Con
 			return err
 		}
 
-		usr := user{
-			access: "grt1",
-			secret: "grt1secret",
-			role:   "user",
-		}
-		if err := createUsers(s, []user{usr}); err != nil {
-			return err
-		}
-		if err := changeBucketsOwner(s, []string{bucket}, usr.access); err != nil {
+		policy := genPolicyDoc("Allow", `"*"`, `["s3:BypassGovernanceRetention"]`, fmt.Sprintf(`"arn:aws:s3:::%v/*"`, bucket))
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+			Bucket: &bucket,
+			Policy: &policy,
+		})
+		cancel()
+		if err != nil {
 			return err
 		}
 
-		cfg := *s
-		cfg.awsID = usr.access
-		cfg.awsSecret = usr.secret
-
-		err = putObjects(s3.NewFromConfig(cfg.Config()), []string{object}, bucket)
-		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLocked)); err != nil {
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &object,
+		})
+		cancel()
+		if err != nil {
 			return err
 		}
 
@@ -6720,11 +10168,140 @@ func WORMProtection_object_lock_retention_governance_user_access_denied(s *S3Con
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
-func WORMProtection_object_lock_legal_hold_user_access_denied(s *S3Conf) error {
-	testName := "WORMProtection_object_lock_legal_hold_user_access_denied"
+func WORMProtection_object_lock_retention_governance_bypass_delete(s *S3Conf) error {
+	testName := "WORMProtection_object_lock_retention_governance_bypass_delete"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		object := "my-obj"
+
+		_, err := putObjects(s3client, []string{object}, bucket)
+		if err != nil {
+			return err
+		}
+
+		date := time.Now().Add(time.Hour * 3)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+			Bucket: &bucket,
+			Key:    &object,
+			Retention: &types.ObjectLockRetention{
+				Mode:            types.ObjectLockRetentionModeGovernance,
+				RetainUntilDate: &date,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		policy := genPolicyDoc("Allow", `"*"`, `["s3:BypassGovernanceRetention"]`, fmt.Sprintf(`"arn:aws:s3:::%v/*"`, bucket))
+		bypass := true
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+			Bucket: &bucket,
+			Policy: &policy,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket:                    &bucket,
+			Key:                       &object,
+			BypassGovernanceRetention: &bypass,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock())
+}
+
+func WORMProtection_object_lock_retention_governance_bypass_delete_mul(s *S3Conf) error {
+	testName := "WORMProtection_object_lock_retention_governance_bypass_delete_mul"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		objs := []string{"my-obj-1", "my-obj2", "my-obj-3"}
+
+		_, err := putObjects(s3client, objs, bucket)
+		if err != nil {
+			return err
+		}
+
+		for _, obj := range objs {
+			o := obj
+			date := time.Now().Add(time.Hour * 3)
+			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+			_, err := s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+				Bucket: &bucket,
+				Key:    &o,
+				Retention: &types.ObjectLockRetention{
+					Mode:            types.ObjectLockRetentionModeGovernance,
+					RetainUntilDate: &date,
+				},
+			})
+			cancel()
+			if err != nil {
+				return err
+			}
+		}
+
+		policy := genPolicyDoc("Allow", `"*"`, `["s3:BypassGovernanceRetention"]`, fmt.Sprintf(`"arn:aws:s3:::%v/*"`, bucket))
+		bypass := true
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+			Bucket: &bucket,
+			Policy: &policy,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket:                    &bucket,
+			BypassGovernanceRetention: &bypass,
+			Delete: &types.Delete{
+				Objects: []types.ObjectIdentifier{
+					{
+						Key: &objs[0],
+					},
+					{
+						Key: &objs[1],
+					},
+					{
+						Key: &objs[2],
+					},
+				},
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock())
+}
+
+func WORMProtection_object_lock_legal_hold_locked(s *S3Conf) error {
+	testName := "WORMProtection_object_lock_legal_hold_locked"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		if err := changeBucketObjectLockStatus(s3client, bucket, true); err != nil {
 			return err
@@ -6732,12 +10309,13 @@ func WORMProtection_object_lock_legal_hold_user_access_denied(s *S3Conf) error {
 
 		object := "my-obj"
 
-		if err := putObjects(s3client, []string{object}, bucket); err != nil {
+		_, err := putObjects(s3client, []string{object}, bucket)
+		if err != nil {
 			return err
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
+		_, err = s3client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
 			Bucket: &bucket,
 			Key:    &object,
 			LegalHold: &types.ObjectLockLegalHold{
@@ -6749,23 +10327,7 @@ func WORMProtection_object_lock_legal_hold_user_access_denied(s *S3Conf) error {
 			return err
 		}
 
-		usr := user{
-			access: "grt1",
-			secret: "grt1secret",
-			role:   "user",
-		}
-		if err := createUsers(s, []user{usr}); err != nil {
-			return err
-		}
-		if err := changeBucketsOwner(s, []string{bucket}, usr.access); err != nil {
-			return err
-		}
-
-		cfg := *s
-		cfg.awsID = usr.access
-		cfg.awsSecret = usr.secret
-
-		err = putObjects(s3.NewFromConfig(cfg.Config()), []string{object}, bucket)
+		_, err = putObjects(s3client, []string{object}, bucket)
 		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLocked)); err != nil {
 			return err
 		}
@@ -6775,28 +10337,26 @@ func WORMProtection_object_lock_legal_hold_user_access_denied(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
-func WORMProtection_object_lock_legal_hold_root_overwrite(s *S3Conf) error {
-	testName := "WORMProtection_object_lock_legal_hold_root_overwrite"
+func WORMProtection_root_bypass_governance_retention_delete_object(s *S3Conf) error {
+	testName := "WORMProtection_root_bypass_governance_retention_delete_object"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		if err := changeBucketObjectLockStatus(s3client, bucket, true); err != nil {
+		obj := "my-obj"
+		_, err := putObjects(s3client, []string{obj}, bucket)
+		if err != nil {
 			return err
 		}
 
-		object := "my-obj"
-
-		if err := putObjects(s3client, []string{object}, bucket); err != nil {
-			return err
-		}
-
+		retDate := time.Now().Add(time.Hour * 48)
 		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
 			Bucket: &bucket,
-			Key:    &object,
-			LegalHold: &types.ObjectLockLegalHold{
-				Status: types.ObjectLockLegalHoldStatusOn,
+			Key:    &obj,
+			Retention: &types.ObjectLockRetention{
+				Mode:            types.ObjectLockRetentionModeGovernance,
+				RetainUntilDate: &retDate,
 			},
 		})
 		cancel()
@@ -6804,7 +10364,31 @@ func WORMProtection_object_lock_legal_hold_root_overwrite(s *S3Conf) error {
 			return err
 		}
 
-		if err := putObjects(s3client, []string{object}, bucket); err != nil {
+		if err := checkWORMProtection(s3client, bucket, obj); err != nil {
+			return err
+		}
+
+		policy := genPolicyDoc("Allow", fmt.Sprintf(`"%v"`, s.awsID), `["s3:BypassGovernanceRetention"]`, fmt.Sprintf(`"arn:aws:s3:::%v/*"`, bucket))
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+			Bucket: &bucket,
+			Policy: &policy,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		bypass := true
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket:                    &bucket,
+			Key:                       &obj,
+			BypassGovernanceRetention: &bypass,
+		})
+		cancel()
+		if err != nil {
 			return err
 		}
 
@@ -6813,7 +10397,7 @@ func WORMProtection_object_lock_legal_hold_root_overwrite(s *S3Conf) error {
 		}
 
 		return nil
-	})
+	}, withLock())
 }
 
 // Access control tests (with bucket ACLs and Policies)
@@ -6834,7 +10418,7 @@ func AccessControl_default_ACL_user_access_denied(s *S3Conf) error {
 		cfg.awsID = usr.access
 		cfg.awsSecret = usr.secret
 
-		err = putObjects(s3.NewFromConfig(cfg.Config()), []string{"my-obj"}, bucket)
+		_, err = putObjects(s3.NewFromConfig(cfg.Config()), []string{"my-obj"}, bucket)
 		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrAccessDenied)); err != nil {
 			return err
 		}
@@ -6860,7 +10444,7 @@ func AccessControl_default_ACL_userplus_access_denied(s *S3Conf) error {
 		cfg.awsID = usr.access
 		cfg.awsSecret = usr.secret
 
-		err = putObjects(s3.NewFromConfig(cfg.Config()), []string{"my-obj"}, bucket)
+		_, err = putObjects(s3.NewFromConfig(cfg.Config()), []string{"my-obj"}, bucket)
 		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrAccessDenied)); err != nil {
 			return err
 		}
@@ -6886,7 +10470,7 @@ func AccessControl_default_ACL_admin_successful_access(s *S3Conf) error {
 		cfg.awsID = admin.access
 		cfg.awsSecret = admin.secret
 
-		err = putObjects(s3.NewFromConfig(cfg.Config()), []string{"my-obj"}, bucket)
+		_, err = putObjects(s3.NewFromConfig(cfg.Config()), []string{"my-obj"}, bucket)
 		if err != nil {
 			return err
 		}
@@ -6992,14 +10576,14 @@ func AccessControl_bucket_resource_all_action(s *S3Conf) error {
 		}
 
 		user1Client := getUserS3Client(usr1, s)
-		err = putObjects(user1Client, []string{"my-obj"}, bucket)
+		_, err = putObjects(user1Client, []string{"my-obj"}, bucket)
 		if err != nil {
 			return err
 		}
 
 		user2Client := getUserS3Client(usr2, s)
 
-		err = putObjects(user2Client, []string{"my-obj"}, bucket)
+		_, err = putObjects(user2Client, []string{"my-obj"}, bucket)
 		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrAccessDenied)); err != nil {
 			return err
 		}
@@ -7012,7 +10596,7 @@ func AccessControl_single_object_resource_actions(s *S3Conf) error {
 	testName := "AccessControl_single_object_resource_actions"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
 		obj := "my-obj/nested-obj"
-		err := putObjects(s3client, []string{obj}, bucket)
+		_, err := putObjects(s3client, []string{obj}, bucket)
 		if err != nil {
 			return err
 		}
@@ -7130,6 +10714,183 @@ func AccessControl_multi_statement_policy(s *S3Conf) error {
 	})
 }
 
+func AccessControl_bucket_ownership_to_user(s *S3Conf) error {
+	testName := "AccessControl_bucket_ownership_to_user"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		usr := user{
+			access: "grt1",
+			secret: "grt1secret",
+			role:   "user",
+		}
+
+		if err := createUsers(s, []user{usr}); err != nil {
+			return err
+		}
+
+		if err := changeBucketsOwner(s, []string{bucket}, usr.access); err != nil {
+			return err
+		}
+
+		userClient := getUserS3Client(usr, s)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := userClient.HeadBucket(ctx, &s3.HeadBucketInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func AccessControl_root_PutBucketAcl(s *S3Conf) error {
+	testName := "AccessControl_root_PutBucketAcl"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		usr := user{
+			access: "grt1",
+			secret: "grt1secret",
+			role:   "user",
+		}
+
+		if err := createUsers(s, []user{usr}); err != nil {
+			return err
+		}
+
+		if err := changeBucketsOwner(s, []string{bucket}, usr.access); err != nil {
+			return err
+		}
+
+		userClient := getUserS3Client(usr, s)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := userClient.PutBucketAcl(ctx, &s3.PutBucketAclInput{
+			Bucket: &bucket,
+			ACL:    types.BucketCannedACLPrivate,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		return nil
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
+}
+
+func AccessControl_user_PutBucketAcl_with_policy_access(s *S3Conf) error {
+	testName := "AccessControl_user_PutBucketAcl_with_policy_access"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		usr := user{
+			access: "grt1",
+			secret: "grt1secret",
+			role:   "user",
+		}
+
+		if err := createUsers(s, []user{usr}); err != nil {
+			return err
+		}
+
+		policy := genPolicyDoc("Allow", fmt.Sprintf(`"%v"`, usr.access), `"s3:PutBucketAcl"`, fmt.Sprintf(`"arn:aws:s3:::%v"`, bucket))
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+			Bucket: &bucket,
+			Policy: &policy,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		userClient := getUserS3Client(usr, s)
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = userClient.PutBucketAcl(ctx, &s3.PutBucketAclInput{
+			Bucket: &bucket,
+			ACL:    types.BucketCannedACLPublicRead,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.GetBucketAcl(ctx, &s3.GetBucketAclInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		expectedGrants := []types.Grant{
+			{
+				Grantee: &types.Grantee{
+					ID:   &s.awsID,
+					Type: types.TypeCanonicalUser,
+				},
+				Permission: types.PermissionFullControl,
+			},
+			{
+				Grantee: &types.Grantee{
+					ID:   getPtr("all-users"),
+					Type: types.TypeGroup,
+				},
+				Permission: types.PermissionRead,
+			},
+		}
+
+		if !compareGrants(res.Grants, expectedGrants) {
+			return fmt.Errorf("expected the resulting grants to be %v, instead got %v", expectedGrants, res.Grants)
+		}
+
+		return nil
+	}, withOwnership(types.ObjectOwnershipBucketOwnerPreferred))
+}
+
+func AccessControl_copy_object_with_starting_slash_for_user(s *S3Conf) error {
+	testName := "AccessControl_copy_object_with_starting_slash_for_user"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := putObjects(s3client, []string{obj}, bucket)
+		if err != nil {
+			return err
+		}
+
+		usr := user{
+			access: "grt1",
+			secret: "grt1secret",
+			role:   "user",
+		}
+
+		if err := changeBucketsOwner(s, []string{bucket}, usr.access); err != nil {
+			return err
+		}
+
+		copySource := fmt.Sprintf("/%v/%v", bucket, obj)
+		meta := map[string]string{
+			"key1": "val1",
+		}
+
+		userClient := getUserS3Client(usr, s)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = userClient.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:            &bucket,
+			Key:               &obj,
+			CopySource:        &copySource,
+			Metadata:          meta,
+			MetadataDirective: types.MetadataDirectiveReplace,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
 // IAM related tests
 // multi-user iam tests
 func IAM_user_access_denied(s *S3Conf) error {
@@ -7153,9 +10914,9 @@ func IAM_user_access_denied(s *S3Conf) error {
 		failF("%v: expected cmd error", testName)
 		return fmt.Errorf("%v: expected cmd error", testName)
 	}
-	if !strings.Contains(string(out), adminAccessDeniedMsg) {
-		failF("%v: expected response error message to be %v, instead got %s", testName, adminAccessDeniedMsg, out)
-		return fmt.Errorf("%v: expected response error message to be %v, instead got %s", testName, adminAccessDeniedMsg, out)
+	if !strings.Contains(string(out), s3err.GetAPIError(s3err.ErrAdminAccessDenied).Code) {
+		failF("%v: expected response error message to be %v, instead got %s", testName, s3err.GetAPIError(s3err.ErrAdminAccessDenied).Error(), out)
+		return fmt.Errorf("%v: expected response error message to be %v, instead got %s", testName, s3err.GetAPIError(s3err.ErrAdminAccessDenied).Error(), out)
 	}
 
 	passF(testName)
@@ -7184,9 +10945,9 @@ func IAM_userplus_access_denied(s *S3Conf) error {
 		failF("%v: expected cmd error", testName)
 		return fmt.Errorf("%v: expected cmd error", testName)
 	}
-	if !strings.Contains(string(out), adminAccessDeniedMsg) {
-		failF("%v: expected response error message to be %v, instead got %s", testName, adminAccessDeniedMsg, out)
-		return fmt.Errorf("%v: expected response error message to be %v, instead got %s", testName, adminAccessDeniedMsg, out)
+	if !strings.Contains(string(out), s3err.GetAPIError(s3err.ErrAdminAccessDenied).Code) {
+		failF("%v: expected response error message to be %v, instead got %s", testName, s3err.GetAPIError(s3err.ErrAdminAccessDenied).Error(), out)
+		return fmt.Errorf("%v: expected response error message to be %v, instead got %s", testName, s3err.GetAPIError(s3err.ErrAdminAccessDenied).Error(), out)
 	}
 
 	passF(testName)
@@ -7272,11 +11033,38 @@ func IAM_admin_ChangeBucketOwner(s *S3Conf) error {
 	})
 }
 
+func IAM_ChangeBucketOwner_back_to_root(s *S3Conf) error {
+	testName := "IAM_ChangeBucketOwner_back_to_root"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		usr := user{
+			access: "grt1",
+			secret: "grt1secret",
+			role:   "user",
+		}
+
+		if err := createUsers(s, []user{usr}); err != nil {
+			return err
+		}
+
+		// Change the bucket ownership to a random user
+		if err := changeBucketsOwner(s, []string{bucket}, usr.access); err != nil {
+			return err
+		}
+
+		// Change the bucket ownership back to the root user
+		if err := changeBucketsOwner(s, []string{bucket}, s.awsID); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
 // Posix related tests
 func PutObject_overwrite_dir_obj(s *S3Conf) error {
 	testName := "PutObject_overwrite_dir_obj"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		err := putObjects(s3client, []string{"foo/", "foo"}, bucket)
+		_, err := putObjects(s3client, []string{"foo/", "foo"}, bucket)
 		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrExistingObjectIsDirectory)); err != nil {
 			return err
 		}
@@ -7287,7 +11075,18 @@ func PutObject_overwrite_dir_obj(s *S3Conf) error {
 func PutObject_overwrite_file_obj(s *S3Conf) error {
 	testName := "PutObject_overwrite_file_obj"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		err := putObjects(s3client, []string{"foo", "foo/"}, bucket)
+		_, err := putObjects(s3client, []string{"foo", "foo/"}, bucket)
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectParentIsFile)); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func PutObject_overwrite_file_obj_with_nested_obj(s *S3Conf) error {
+	testName := "PutObject_overwrite_file_obj_with_nested_obj"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		_, err := putObjects(s3client, []string{"foo", "foo/bar"}, bucket)
 		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectParentIsFile)); err != nil {
 			return err
 		}
@@ -7298,7 +11097,7 @@ func PutObject_overwrite_file_obj(s *S3Conf) error {
 func PutObject_dir_obj_with_data(s *S3Conf) error {
 	testName := "PutObject_dir_obj_with_data"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
-		_, _, err := putObjectWithData(int64(20), &s3.PutObjectInput{
+		_, err := putObjectWithData(int64(20), &s3.PutObjectInput{
 			Bucket: &bucket,
 			Key:    getPtr("obj/"),
 		}, s3client)
@@ -7318,4 +11117,2549 @@ func CreateMultipartUpload_dir_obj(s *S3Conf) error {
 		}
 		return nil
 	})
+}
+
+func PutObject_name_too_long(s *S3Conf) error {
+	testName := "PutObject_name_too_long"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		key := genRandString(300)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &key,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrKeyTooLong)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func HeadObject_name_too_long(s *S3Conf) error {
+	testName := "HeadObject_name_too_long"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    getPtr(genRandString(300)),
+		})
+		cancel()
+		if err := checkSdkApiErr(err, "BadRequest"); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func DeleteObject_name_too_long(s *S3Conf) error {
+	testName := "DeleteObject_name_too_long"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: &bucket,
+			Key:    getPtr(genRandString(300)),
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrKeyTooLong)); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// Versioning tests
+func PutBucketVersioning_non_existing_bucket(s *S3Conf) error {
+	testName := "PutBucketVersioning_non_existing_bucket"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		err := putBucketVersioningStatus(s3client, getBucketName(), types.BucketVersioningStatusSuspended)
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchBucket)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func PutBucketVersioning_invalid_status(s *S3Conf) error {
+	testName := "PutBucketVersioning_invalid_status"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		err := putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatus("invalid_status"))
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMalformedXML)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func PutBucketVersioning_success_enabled(s *S3Conf) error {
+	testName := "PutBucketVersioning_success_enabled"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		err := putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusEnabled)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func PutBucketVersioning_success_suspended(s *S3Conf) error {
+	testName := "PutBucketVersioning_success_suspended"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		err := putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusSuspended)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func GetBucketVersioning_non_existing_bucket(s *S3Conf) error {
+	testName := "GetBucketVersioning_non_existing_bucket"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
+			Bucket: getPtr(getBucketName()),
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchBucket)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func GetBucketVersioning_empty_response(s *S3Conf) error {
+	testName := "GetBucketVersioning_empty_response"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if res.Status != "" {
+			return fmt.Errorf("expected empty versioning status, instead got %v", res.Status)
+		}
+		if res.MFADelete != "" {
+			return fmt.Errorf("expected empty mfa delete status, instead got %v", res.MFADelete)
+		}
+
+		return nil
+	})
+}
+
+func GetBucketVersioning_success(s *S3Conf) error {
+	testName := "GetBucketVersioning_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if res.Status != types.BucketVersioningStatusEnabled {
+			return fmt.Errorf("expected bucket versioning status to be %v, instead got %v", types.BucketVersioningStatusEnabled, res.Status)
+		}
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_DeleteBucket_not_empty(s *S3Conf) error {
+	testName := "Versioning_DeleteBucket_not_empty"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := createObjVersions(s3client, bucket, obj, 2)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteBucket(ctx, &s3.DeleteBucketInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrVersionedBucketNotEmpty)); err != nil {
+			return err
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_PutObject_suspended_null_versionId_obj(s *S3Conf) error {
+	testName := "Versioning_PutObject_suspended_null_versionId_obj"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		out, err := putObjectWithData(1222, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		if getString(out.res.VersionId) != nullVersionId {
+			return fmt.Errorf("expected the uploaded object versionId to be %v, instead got %v", nullVersionId, getString(out.res.VersionId))
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusSuspended))
+}
+
+func Versioning_PutObject_null_versionId_obj(s *S3Conf) error {
+	testName := "Versioning_PutObject_null_versionId_obj"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj, lgth := "my-obj", int64(1234)
+		out, err := putObjectWithData(lgth, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		// Enable bucket versioning
+		err = putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusEnabled)
+		if err != nil {
+			return err
+		}
+
+		versions, err := createObjVersions(s3client, bucket, obj, 4)
+		if err != nil {
+			return err
+		}
+
+		versions = append(versions, types.ObjectVersion{
+			ETag:         out.res.ETag,
+			IsLatest:     getBoolPtr(false),
+			Key:          &obj,
+			Size:         &lgth,
+			VersionId:    &nullVersionId,
+			StorageClass: types.ObjectVersionStorageClassStandard,
+		})
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !compareVersions(versions, res.Versions) {
+			return fmt.Errorf("expected the listed versions to be %v, instead got %v", versions, res.Versions)
+		}
+
+		return nil
+	})
+}
+
+func Versioning_PutObject_overwrite_null_versionId_obj(s *S3Conf) error {
+	testName := "Versioning_PutObject_overwrite_null_versionId_obj"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := putObjectWithData(int64(1233), &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		// Enable bucket versioning
+		err = putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusEnabled)
+		if err != nil {
+			return err
+		}
+
+		versions, err := createObjVersions(s3client, bucket, obj, 4)
+		if err != nil {
+			return err
+		}
+
+		// Set bucket versioning status to Suspended
+		err = putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusSuspended)
+		if err != nil {
+			return err
+		}
+
+		lgth := int64(3200)
+		out, err := putObjectWithData(lgth, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		if getString(out.res.VersionId) != nullVersionId {
+			return fmt.Errorf("expected the uploaded object versionId to be %v, insted got %v", nullVersionId, getString(out.res.VersionId))
+		}
+
+		versions[0].IsLatest = getBoolPtr(false)
+
+		versions = append([]types.ObjectVersion{
+			{
+				ETag:         out.res.ETag,
+				IsLatest:     getBoolPtr(true),
+				Key:          &obj,
+				Size:         &lgth,
+				VersionId:    &nullVersionId,
+				StorageClass: types.ObjectVersionStorageClassStandard,
+			},
+		}, versions...)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !compareVersions(versions, res.Versions) {
+			return fmt.Errorf("expected the listed versions to be %v, instead got %v", versions, res.Versions)
+		}
+
+		return nil
+	})
+}
+
+func Versioning_PutObject_success(s *S3Conf) error {
+	testName := "Versioning_PutObject_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    getPtr("my-obj"),
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if res.VersionId == nil || *res.VersionId == "" {
+			return fmt.Errorf("expected the versionId to be returned")
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_CopyObject_success(s *S3Conf) error {
+	testName := "Versioning_CopyObject_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dstObj := "dst-obj"
+		srcBucket, srcObj := getBucketName(), "src-obj"
+
+		if err := setup(s, srcBucket); err != nil {
+			return err
+		}
+
+		dstObjVersions, err := createObjVersions(s3client, bucket, dstObj, 1)
+		if err != nil {
+			return err
+		}
+
+		srcObjLen := int64(2345)
+		_, err = putObjectWithData(srcObjLen, &s3.PutObjectInput{
+			Bucket: &srcBucket,
+			Key:    &srcObj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:     &bucket,
+			Key:        &dstObj,
+			CopySource: getPtr(fmt.Sprintf("%v/%v", srcBucket, srcObj)),
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if err := teardown(s, srcBucket); err != nil {
+			return err
+		}
+
+		if out.VersionId == nil || *out.VersionId == "" {
+			return fmt.Errorf("expected non empty versionId in the result")
+		}
+
+		dstObjVersions[0].IsLatest = getBoolPtr(false)
+		versions := append([]types.ObjectVersion{
+			{
+				ETag:         out.CopyObjectResult.ETag,
+				IsLatest:     getBoolPtr(true),
+				Key:          &dstObj,
+				Size:         &srcObjLen,
+				VersionId:    out.VersionId,
+				StorageClass: types.ObjectVersionStorageClassStandard,
+			},
+		}, dstObjVersions...)
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !compareVersions(versions, res.Versions) {
+			return fmt.Errorf("expected the resulting versions to be %v, instead got %v", versions, res.Versions)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_CopyObject_non_existing_version_id(s *S3Conf) error {
+	testName := "Versioning_CopyObject_non_existing_version_id"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dstBucket, dstObj := getBucketName(), "my-obj"
+		srcObj := "my-obj"
+
+		if err := setup(s, dstBucket); err != nil {
+			return err
+		}
+
+		_, err := createObjVersions(s3client, bucket, srcObj, 1)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:     &dstBucket,
+			Key:        &dstObj,
+			CopySource: getPtr(fmt.Sprintf("%v/%v?versionId=invalid_versionId", bucket, srcObj)),
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchVersion)); err != nil {
+			return err
+		}
+
+		if err := teardown(s, dstBucket); err != nil {
+			return err
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_CopyObject_from_an_object_version(s *S3Conf) error {
+	testName := "Versioning_CopyObject_from_an_object_version"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		srcBucket, srcObj, dstObj := getBucketName(), "my-obj", "my-dst-obj"
+		if err := setup(s, srcBucket, withVersioning(types.BucketVersioningStatusEnabled)); err != nil {
+			return err
+		}
+
+		srcObjVersions, err := createObjVersions(s3client, srcBucket, srcObj, 1)
+		if err != nil {
+			return err
+		}
+		srcObjVersion := srcObjVersions[0]
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:     &bucket,
+			Key:        &dstObj,
+			CopySource: getPtr(fmt.Sprintf("%v/%v?versionId=%v", srcBucket, srcObj, *srcObjVersion.VersionId)),
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if err := teardown(s, srcBucket); err != nil {
+			return err
+		}
+
+		if out.VersionId == nil || *out.VersionId == "" {
+			return fmt.Errorf("expected non empty versionId")
+		}
+		if *out.CopySourceVersionId != *srcObjVersion.VersionId {
+			return fmt.Errorf("expected the SourceVersionId to be %v, instead got %v", *srcObjVersion.VersionId, *out.CopySourceVersionId)
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket:    &bucket,
+			Key:       &dstObj,
+			VersionId: out.VersionId,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *res.ContentLength != *srcObjVersion.Size {
+			return fmt.Errorf("expected the copied object size to be %v, instead got %v", *srcObjVersion.Size, *res.ContentLength)
+		}
+		if *res.VersionId != *out.VersionId {
+			return fmt.Errorf("expected the copied object versionId to be %v, instead got %v", *out.VersionId, *res.VersionId)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_CopyObject_special_chars(s *S3Conf) error {
+	testName := "Versioning_CopyObject_special_chars"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		srcObj, dstBucket, dstObj := "foo?bar", getBucketName(), "bar&foo"
+		err := setup(s, dstBucket)
+		if err != nil {
+			return err
+		}
+
+		srcObjVersions, err := createObjVersions(s3client, bucket, srcObj, 1)
+		if err != nil {
+			return err
+		}
+
+		srcObjVersionId := *srcObjVersions[0].VersionId
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:     &bucket,
+			Key:        &dstObj,
+			CopySource: getPtr(fmt.Sprintf("%v/%v?versionId=%v", bucket, srcObj, srcObjVersionId)),
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if res.VersionId == nil || *res.VersionId == "" {
+			return fmt.Errorf("expected non empty versionId")
+		}
+		if *res.CopySourceVersionId != srcObjVersionId {
+			return fmt.Errorf("expected the SourceVersionId to be %v, instead got %v", srcObjVersionId, *res.CopySourceVersionId)
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket:    &bucket,
+			Key:       &dstObj,
+			VersionId: res.VersionId,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *out.VersionId != *res.VersionId {
+			return fmt.Errorf("expected the copied object versionId to be %v, instead got %v", *res.VersionId, *out.VersionId)
+		}
+
+		err = teardown(s, dstBucket)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_HeadObject_invalid_versionId(s *S3Conf) error {
+	testName := "Versioning_HeadObject_invalid_versionId"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dLen := int64(2000)
+		obj := "my-obj"
+		_, err := putObjectWithData(dLen, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: getPtr("invalid_version_id"),
+		})
+		cancel()
+		if err := checkSdkApiErr(err, "BadRequest"); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func Versioning_HeadObject_invalid_parent(s *S3Conf) error {
+	testName := "Versioning_HeadObject_invalid_parent"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dLen := int64(2000)
+		obj := "not-a-dir"
+		r, err := putObjectWithData(dLen, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		obj = "not-a-dir/bad-obj"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: r.res.VersionId,
+		})
+		cancel()
+		if err := checkSdkApiErr(err, "NotFound"); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func Versioning_HeadObject_success(s *S3Conf) error {
+	testName := "Versioning_HeadObject_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dLen := int64(2000)
+		obj := "my-obj"
+		r, err := putObjectWithData(dLen, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: r.res.VersionId,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *out.ContentLength != dLen {
+			return fmt.Errorf("expected the object content-length to be %v, instead got %v", dLen, *out.ContentLength)
+		}
+		if *out.VersionId != *r.res.VersionId {
+			return fmt.Errorf("expected the versionId to be %v, instead got %v", *r.res.VersionId, *out.VersionId)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_HeadObject_without_versionId(s *S3Conf) error {
+	testName := "Versioning_HeadObject_without_versionId"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		versions, err := createObjVersions(s3client, bucket, obj, 3)
+		if err != nil {
+			return err
+		}
+
+		lastVersion := versions[0]
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if getString(res.VersionId) != *lastVersion.VersionId {
+			return fmt.Errorf("expected versionId to be %v, instead got %v", *lastVersion.VersionId, getString(res.VersionId))
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_HeadObject_delete_marker(s *S3Conf) error {
+	testName := "Versioning_HeadObject_delete_marker"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dLen := int64(2000)
+		obj := "my-obj"
+		_, err := putObjectWithData(dLen, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if out.VersionId == nil || *out.VersionId == "" {
+			return fmt.Errorf("expected non empty versionId")
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: out.VersionId,
+		})
+		cancel()
+		if err := checkSdkApiErr(err, "MethodNotAllowed"); err != nil {
+			return err
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_GetObject_invalid_versionId(s *S3Conf) error {
+	testName := "Versioning_GetObject_invalid_versionId"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dLen := int64(2000)
+		obj := "my-obj"
+		_, err := putObjectWithData(dLen, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: getPtr("invalid_version_id"),
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidVersionId)); err != nil {
+			return err
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_GetObject_success(s *S3Conf) error {
+	testName := "Versioning_GetObject_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dLen := int64(2000)
+		obj := "my-obj"
+		r, err := putObjectWithData(dLen, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		// Get the object by versionId
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: r.res.VersionId,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *out.ContentLength != dLen {
+			return fmt.Errorf("expected the object content-length to be %v, instead got %v", dLen, *out.ContentLength)
+		}
+		if *out.VersionId != *r.res.VersionId {
+			return fmt.Errorf("expected the versionId to be %v, instead got %v", *r.res.VersionId, *out.VersionId)
+		}
+
+		bdy, err := io.ReadAll(out.Body)
+		if err != nil {
+			return err
+		}
+		defer out.Body.Close()
+
+		outCsum := sha256.Sum256(bdy)
+		if outCsum != r.csum {
+			return fmt.Errorf("incorrect output content")
+		}
+
+		// Get the object without versionId
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		out, err = s3client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *out.ContentLength != dLen {
+			return fmt.Errorf("expected the object content-length to be %v, instead got %v", dLen, *out.ContentLength)
+		}
+		if *out.VersionId != *r.res.VersionId {
+			return fmt.Errorf("expected the versionId to be %v, instead got %v", *r.res.VersionId, *out.VersionId)
+		}
+
+		bdy, err = io.ReadAll(out.Body)
+		if err != nil {
+			return err
+		}
+		defer out.Body.Close()
+
+		outCsum = sha256.Sum256(bdy)
+		if outCsum != r.csum {
+			return fmt.Errorf("incorrect output content")
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_GetObject_delete_marker_without_versionId(s *S3Conf) error {
+	testName := "Versioning_GetObject_delete_marker_without_versionId"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := putObjectWithData(1234, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		err = putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusEnabled)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err := checkSdkApiErr(err, "NoSuchKey"); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func Versioning_GetObject_delete_marker(s *S3Conf) error {
+	testName := "Versioning_GetObject_delete_marker"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dLen := int64(2000)
+		obj := "my-obj"
+		_, err := putObjectWithData(dLen, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if out.VersionId == nil || *out.VersionId == "" {
+			return fmt.Errorf("expected non empty versionId")
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: out.VersionId,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrMethodNotAllowed)); err != nil {
+			return err
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_GetObject_null_versionId_obj(s *S3Conf) error {
+	testName := "Versioning_GetObject_null_versionId_obj"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj, lgth := "my-obj", int64(234)
+		out, err := putObjectWithData(lgth, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		err = putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusEnabled)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: &nullVersionId,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *res.ContentLength != lgth {
+			return fmt.Errorf("expected the Content-Length to be %v, instead got %v", lgth, *res.ContentLength)
+		}
+		if *res.VersionId != nullVersionId {
+			return fmt.Errorf("expected the versionId to be %v, insted got %v", nullVersionId, *res.VersionId)
+		}
+		if *res.ETag != *out.res.ETag {
+			return fmt.Errorf("expecte the ETag to be %v, instead got %v", *out.res.ETag, *res.ETag)
+		}
+
+		return nil
+	})
+}
+
+func Versioning_GetObjectAttributes_object_version(s *S3Conf) error {
+	testName := "Versioning_GetObjectAttributes_object_version"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		versions, err := createObjVersions(s3client, bucket, obj, 1)
+		if err != nil {
+			return err
+		}
+		version := versions[0]
+
+		getObjAttrs := func(versionId *string) (*s3.GetObjectAttributesOutput, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+			res, err := s3client.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+				Bucket:    &bucket,
+				Key:       &obj,
+				VersionId: versionId,
+				ObjectAttributes: []types.ObjectAttributes{
+					types.ObjectAttributesEtag,
+				},
+			})
+			cancel()
+			return res, err
+		}
+
+		// By specifying the versionId
+		res, err := getObjAttrs(version.VersionId)
+		if err != nil {
+			return err
+		}
+
+		if getString(res.ETag) != *version.ETag {
+			return fmt.Errorf("expected the uploaded object ETag to be %v, instead got %v", *version.ETag, getString(res.ETag))
+		}
+		if getString(res.VersionId) != *version.VersionId {
+			return fmt.Errorf("expected the uploaded versionId to be %v, instead got %v", *version.VersionId, getString(res.VersionId))
+		}
+
+		// Without versionId
+		res, err = getObjAttrs(nil)
+		if err != nil {
+			return err
+		}
+
+		if getString(res.ETag) != *version.ETag {
+			return fmt.Errorf("expected the uploaded object ETag to be %v, instead got %v", *version.ETag, getString(res.ETag))
+		}
+		if getString(res.VersionId) != *version.VersionId {
+			return fmt.Errorf("expected the uploaded object versionId to be %v, instead got %v", *version.VersionId, getString(res.VersionId))
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_GetObjectAttributes_delete_marker(s *S3Conf) error {
+	testName := "Versioning_GetObjectAttributes_delete_marker"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := createObjVersions(s3client, bucket, obj, 1)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: res.VersionId,
+			ObjectAttributes: []types.ObjectAttributes{
+				types.ObjectAttributesEtag,
+			},
+		})
+		cancel()
+		if err := checkSdkApiErr(err, "NoSuchKey"); err != nil {
+			return err
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_DeleteObject_delete_object_version(s *S3Conf) error {
+	testName := "Versioning_DeleteObject_delete_object_version"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		oLen := int64(1000)
+		obj := "my-obj"
+		r, err := putObjectWithData(oLen, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		versionId := r.res.VersionId
+		if versionId == nil || *versionId == "" {
+			return fmt.Errorf("expected non empty versionId")
+		}
+
+		_, err = putObjects(s3client, []string{obj}, bucket)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: versionId,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *out.VersionId != *versionId {
+			return fmt.Errorf("expected deleted object versionId to be %v, instead got %v", *versionId, *out.VersionId)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_DeleteObject_non_existing_object(s *S3Conf) error {
+	testName := "Versioning_DeleteObject_non_existing_object"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+
+		ctx, canel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		canel()
+		if err != nil {
+			return err
+		}
+
+		ctx, canel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: getPtr("non_existing_version_id"),
+		})
+		canel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidVersionId)); err != nil {
+			return err
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_DeleteObject_delete_a_delete_marker(s *S3Conf) error {
+	testName := "Versioning_DeleteObject_delete_a_delete_marker"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		oLen := int64(1000)
+		obj := "my-obj"
+		_, err := putObjectWithData(oLen, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if out.DeleteMarker == nil || !*out.DeleteMarker {
+			return fmt.Errorf("expected the response DeleteMarker to be true")
+		}
+		if out.VersionId == nil || *out.VersionId == "" {
+			return fmt.Errorf("expected non empty versionId")
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: out.VersionId,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if res.DeleteMarker == nil || !*res.DeleteMarker {
+			return fmt.Errorf("expected the response DeleteMarker to be true")
+		}
+		if *res.VersionId != *out.VersionId {
+			return fmt.Errorf("expected the versionId to be %v, instead got %v", *out.VersionId, *res.VersionId)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_Delete_null_versionId_object(s *S3Conf) error {
+	testName := "Versioning_Delete_null_versionId_object"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj, nObjLgth := "my-obj", int64(3211)
+		_, err := putObjectWithData(nObjLgth, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		err = putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusEnabled)
+		if err != nil {
+			return err
+		}
+
+		_, err = createObjVersions(s3client, bucket, obj, 3)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: getPtr(nullVersionId),
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+		if getString(res.VersionId) != nullVersionId {
+			return fmt.Errorf("expected the versionId to be %v, instead got %v", nullVersionId, getString(res.VersionId))
+		}
+
+		return nil
+	})
+}
+
+func Versioning_DeleteObject_suspended(s *S3Conf) error {
+	testName := "Versioning_DeleteObject_suspended"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		versions, err := createObjVersions(s3client, bucket, obj, 1)
+		if err != nil {
+			return err
+		}
+		versions[0].IsLatest = getBoolPtr(false)
+
+		err = putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusSuspended)
+		if err != nil {
+			return err
+		}
+
+		for i := 0; i < 5; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+			res, err := s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+				Bucket: &bucket,
+				Key:    &obj,
+			})
+			cancel()
+			if err != nil {
+				return err
+			}
+
+			if !*res.DeleteMarker {
+				return fmt.Errorf("expected the delete marker to be true, instead got %v", *res.DeleteMarker)
+			}
+			if *res.VersionId != nullVersionId {
+				return fmt.Errorf("expected the versionId to be %v, instead got %v", nullVersionId, *res.VersionId)
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		delMarkers := []types.DeleteMarkerEntry{
+			{
+				IsLatest:  getBoolPtr(true),
+				Key:       &obj,
+				VersionId: &nullVersionId,
+			},
+		}
+
+		if !compareVersions(res.Versions, versions) {
+			return fmt.Errorf("expected the versions to be %v, instead got %v", versions, res.Versions)
+		}
+		if !compareDelMarkers(res.DeleteMarkers, delMarkers) {
+			return fmt.Errorf("expected the delete markers to be %v, instead got %v", delMarkers, res.DeleteMarkers)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_DeleteObjects_success(s *S3Conf) error {
+	testName := "Versioning_DeleteObjects_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj1, obj2, obj3 := "foo", "bar", "baz"
+
+		obj1Version, err := createObjVersions(s3client, bucket, obj1, 1)
+		if err != nil {
+			return err
+		}
+		obj2Version, err := createObjVersions(s3client, bucket, obj2, 1)
+		if err != nil {
+			return err
+		}
+		obj3Version, err := createObjVersions(s3client, bucket, obj3, 1)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: &bucket,
+			Delete: &types.Delete{
+				Objects: []types.ObjectIdentifier{
+					{
+						Key:       obj1Version[0].Key,
+						VersionId: obj1Version[0].VersionId,
+					},
+					{
+						Key: obj2Version[0].Key,
+					},
+					{
+						Key: obj3Version[0].Key,
+					},
+				},
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		delResult := []types.DeletedObject{
+			{
+				Key:          obj1Version[0].Key,
+				VersionId:    obj1Version[0].VersionId,
+				DeleteMarker: getBoolPtr(false),
+			},
+			{
+				Key:          obj2Version[0].Key,
+				DeleteMarker: getBoolPtr(true),
+			},
+			{
+				Key:          obj3Version[0].Key,
+				DeleteMarker: getBoolPtr(true),
+			},
+		}
+
+		if len(out.Errors) != 0 {
+			return fmt.Errorf("errors occurred during the deletion: %v", out.Errors)
+		}
+		if !compareDelObjects(delResult, out.Deleted) {
+			return fmt.Errorf("expected the deleted objects to be %v, instead got %v", delResult, out.Deleted)
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		obj2Version[0].IsLatest = getBoolPtr(false)
+		obj3Version[0].IsLatest = getBoolPtr(false)
+		versions := append(obj2Version, obj3Version...)
+
+		delMarkers := []types.DeleteMarkerEntry{
+			{
+				IsLatest:  getBoolPtr(true),
+				Key:       out.Deleted[1].Key,
+				VersionId: out.Deleted[1].DeleteMarkerVersionId,
+			},
+			{
+				IsLatest:  getBoolPtr(true),
+				Key:       out.Deleted[2].Key,
+				VersionId: out.Deleted[2].DeleteMarkerVersionId,
+			},
+		}
+		if !compareVersions(versions, res.Versions) {
+			return fmt.Errorf("expected the resulting versions to be %v, instead got %v", versions, res.Versions)
+		}
+		if !compareDelMarkers(delMarkers, res.DeleteMarkers) {
+			return fmt.Errorf("expected the resulting delete markers to be %v, instead got %v", delMarkers, res.DeleteMarkers)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_DeleteObjects_delete_deleteMarkers(s *S3Conf) error {
+	testName := "Versioning_DeleteObjects_delete_deleteMarkers"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj1, obj2 := "foo", "bar"
+
+		obj1Version, err := createObjVersions(s3client, bucket, obj1, 1)
+		if err != nil {
+			return err
+		}
+		obj2Version, err := createObjVersions(s3client, bucket, obj2, 1)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: &bucket,
+			Delete: &types.Delete{
+				Objects: []types.ObjectIdentifier{
+					{
+						Key: obj1Version[0].Key,
+					},
+					{
+						Key: obj2Version[0].Key,
+					},
+				},
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		delResult := []types.DeletedObject{
+			{
+				Key:          obj1Version[0].Key,
+				DeleteMarker: getBoolPtr(true),
+			},
+			{
+				Key:          obj2Version[0].Key,
+				DeleteMarker: getBoolPtr(true),
+			},
+		}
+
+		if len(out.Errors) != 0 {
+			return fmt.Errorf("errors occurred during the deletion: %v", out.Errors)
+		}
+		if !compareDelObjects(delResult, out.Deleted) {
+			return fmt.Errorf("expected the deleted objects to be %v, instead got %v", delResult, out.Deleted)
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: &bucket,
+			Delete: &types.Delete{
+				Objects: []types.ObjectIdentifier{
+					{
+						Key:       out.Deleted[0].Key,
+						VersionId: out.Deleted[0].VersionId,
+					},
+					{
+						Key:       out.Deleted[1].Key,
+						VersionId: out.Deleted[1].VersionId,
+					},
+				},
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+		if len(out.Errors) != 0 {
+			return fmt.Errorf("errors occurred during the deletion: %v", out.Errors)
+		}
+
+		delResult = []types.DeletedObject{
+			{
+				Key:                   out.Deleted[0].Key,
+				DeleteMarker:          getBoolPtr(true),
+				DeleteMarkerVersionId: out.Deleted[0].VersionId,
+				VersionId:             out.Deleted[0].VersionId,
+			},
+			{
+				Key:                   out.Deleted[1].Key,
+				DeleteMarker:          getBoolPtr(true),
+				DeleteMarkerVersionId: out.Deleted[1].VersionId,
+				VersionId:             out.Deleted[1].VersionId,
+			},
+		}
+
+		if !compareDelObjects(delResult, res.Deleted) {
+			return fmt.Errorf("expected the deleted objects to be %v, instead got %v", delResult, res.Deleted)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func ListObjectVersions_non_existing_bucket(s *S3Conf) error {
+	testName := "ListObjectVersions_non_existing_bucket"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: getPtr(getBucketName()),
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchBucket)); err != nil {
+			return err
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func ListObjectVersions_list_single_object_versions(s *S3Conf) error {
+	testName := "ListObjectVersions_list_single_object_versions"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		object := "my-obj"
+		versions, err := createObjVersions(s3client, bucket, object, 5)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !compareVersions(out.Versions, versions) {
+			return fmt.Errorf("expected the resulting versions to be %v, instead got %v", versions, out.Versions)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func ListObjectVersions_list_multiple_object_versions(s *S3Conf) error {
+	testName := "ListObjectVersions_list_multiple_object_versions"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj1, obj2, obj3 := "foo", "bar", "baz"
+
+		obj1Versions, err := createObjVersions(s3client, bucket, obj1, 4)
+		if err != nil {
+			return err
+		}
+		obj2Versions, err := createObjVersions(s3client, bucket, obj2, 3)
+		if err != nil {
+			return err
+		}
+		obj3Versions, err := createObjVersions(s3client, bucket, obj3, 5)
+		if err != nil {
+			return err
+		}
+
+		versions := append(append(obj2Versions, obj3Versions...), obj1Versions...)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !compareVersions(out.Versions, versions) {
+			return fmt.Errorf("expected the resulting versions to be %v, instead got %v", versions, out.Versions)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func ListObjectVersions_multiple_object_versions_truncated(s *S3Conf) error {
+	testName := "ListObjectVersions_multiple_object_versions_truncated"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj1, obj2, obj3 := "foo", "bar", "baz"
+
+		obj1Versions, err := createObjVersions(s3client, bucket, obj1, 4)
+		if err != nil {
+			return err
+		}
+		obj2Versions, err := createObjVersions(s3client, bucket, obj2, 3)
+		if err != nil {
+			return err
+		}
+		obj3Versions, err := createObjVersions(s3client, bucket, obj3, 5)
+		if err != nil {
+			return err
+		}
+
+		versions := append(append(obj2Versions, obj3Versions...), obj1Versions...)
+		maxKeys := int32(5)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket:  &bucket,
+			MaxKeys: &maxKeys,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *out.Name != bucket {
+			return fmt.Errorf("expected the bucket name to be %v, instead got %v", bucket, *out.Name)
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			return fmt.Errorf("expected the output to be truncated")
+		}
+		if out.MaxKeys == nil || *out.MaxKeys != maxKeys {
+			return fmt.Errorf("expected the max-keys to be %v, instead got %v", maxKeys, *out.MaxKeys)
+		}
+		if *out.NextKeyMarker != *versions[maxKeys-1].Key {
+			return fmt.Errorf("expected the NextKeyMarker to be %v, instead got %v", *versions[maxKeys].Key, *out.NextKeyMarker)
+		}
+		if *out.NextVersionIdMarker != *versions[maxKeys-1].VersionId {
+			return fmt.Errorf("expected the NextVersionIdMarker to be %v, instead got %v", *versions[maxKeys].VersionId, *out.NextVersionIdMarker)
+		}
+
+		if !compareVersions(out.Versions, versions[:maxKeys]) {
+			return fmt.Errorf("expected the resulting object versions to be %v, instead got %v", versions[:maxKeys], out.Versions)
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		out, err = s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket:          &bucket,
+			KeyMarker:       out.NextKeyMarker,
+			VersionIdMarker: out.NextVersionIdMarker,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *out.Name != bucket {
+			return fmt.Errorf("expected the bucket name to be %v, instead got %v", bucket, *out.Name)
+		}
+		if out.IsTruncated != nil && *out.IsTruncated {
+			return fmt.Errorf("expected the output not to be truncated")
+		}
+		if *out.KeyMarker != *versions[maxKeys-1].Key {
+			return fmt.Errorf("expected the KeyMarker to be %v, instead got %v", *versions[maxKeys].Key, *out.KeyMarker)
+		}
+		if *out.VersionIdMarker != *versions[maxKeys-1].VersionId {
+			return fmt.Errorf("expected the VersionIdMarker to be %v, instead got %v", *versions[maxKeys].VersionId, *out.VersionIdMarker)
+		}
+
+		if !compareVersions(out.Versions, versions[maxKeys:]) {
+			return fmt.Errorf("expected the resulting object versions to be %v, instead got %v", versions[maxKeys:], out.Versions)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func ListObjectVersions_with_delete_markers(s *S3Conf) error {
+	testName := "ListObjectVersions_with_delete_markers"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		versions, err := createObjVersions(s3client, bucket, obj, 1)
+		if err != nil {
+			return err
+		}
+
+		versions[0].IsLatest = getBoolPtr(false)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		delMarkers := []types.DeleteMarkerEntry{}
+		delMarkers = append(delMarkers, types.DeleteMarkerEntry{
+			Key:       &obj,
+			VersionId: out.VersionId,
+			IsLatest:  getBoolPtr(true),
+		})
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !compareVersions(res.Versions, versions) {
+			return fmt.Errorf("expected the resulting versions to be %v, instead got %v", versions, res.Versions)
+		}
+		if !compareDelMarkers(res.DeleteMarkers, delMarkers) {
+			return fmt.Errorf("expected the resulting delete markers to be %v, instead got %v", delMarkers, res.DeleteMarkers)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func ListObjectVersions_containing_null_versionId_obj(s *S3Conf) error {
+	testName := "ListObjectVersions_containing_null_versionId_obj"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		versions, err := createObjVersions(s3client, bucket, obj, 3)
+		if err != nil {
+			return err
+		}
+
+		err = putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusSuspended)
+		if err != nil {
+			return err
+		}
+
+		objLgth := int64(543)
+		out, err := putObjectWithData(objLgth, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		if getString(out.res.VersionId) != nullVersionId {
+			return fmt.Errorf("expected the uploaded object versionId to be %v, instead got %v", nullVersionId, getString(out.res.VersionId))
+		}
+
+		versions[0].IsLatest = getBoolPtr(false)
+
+		versions = append([]types.ObjectVersion{
+			{
+				ETag:         out.res.ETag,
+				IsLatest:     getBoolPtr(false),
+				Key:          &obj,
+				Size:         &objLgth,
+				VersionId:    &nullVersionId,
+				StorageClass: types.ObjectVersionStorageClassStandard,
+			},
+		}, versions...)
+
+		err = putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusEnabled)
+		if err != nil {
+			return err
+		}
+
+		newVersions, err := createObjVersions(s3client, bucket, obj, 4)
+		if err != nil {
+			return err
+		}
+
+		versions = append(newVersions, versions...)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !compareVersions(res.Versions, versions) {
+			return fmt.Errorf("expected the listed object versions to be %v, instead got %v", versions, res.Versions)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func ListObjectVersions_single_null_versionId_object(s *S3Conf) error {
+	testName := "ListObjectVersions_single_null_versionId_object"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj, objLgth := "my-obj", int64(890)
+		out, err := putObjectWithData(objLgth, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		err = putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusEnabled)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		versions := []types.ObjectVersion{
+			{
+				ETag:         out.res.ETag,
+				Key:          &obj,
+				StorageClass: types.ObjectVersionStorageClassStandard,
+				IsLatest:     getBoolPtr(false),
+				Size:         &objLgth,
+				VersionId:    &nullVersionId,
+			},
+		}
+		delMarkers := []types.DeleteMarkerEntry{
+			{
+				IsLatest:  getBoolPtr(true),
+				Key:       &obj,
+				VersionId: res.VersionId,
+			},
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		resp, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if !compareDelMarkers(resp.DeleteMarkers, delMarkers) {
+			return fmt.Errorf("expected the delete markers list to be %v, instaed got %v", delMarkers, resp.DeleteMarkers)
+		}
+		if !compareVersions(resp.Versions, versions) {
+			return fmt.Errorf("expected the object versions list to be %v, instead got %v", versions, resp.Versions)
+		}
+
+		return nil
+	})
+}
+
+func Versioning_Multipart_Upload_success(s *S3Conf) error {
+	testName := "Versioning_Multipart_Upload_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		out, err := createMp(s3client, bucket, obj)
+		if err != nil {
+			return err
+		}
+
+		objSize := int64(5 * 1024 * 1024)
+		parts, _, err := uploadParts(s3client, objSize, 5, bucket, obj, *out.UploadId)
+		if err != nil {
+			return err
+		}
+
+		compParts := []types.CompletedPart{}
+		for _, el := range parts {
+			compParts = append(compParts, types.CompletedPart{
+				ETag:       el.ETag,
+				PartNumber: el.PartNumber,
+			})
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:   &bucket,
+			Key:      &obj,
+			UploadId: out.UploadId,
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: compParts,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *res.Key != obj {
+			return fmt.Errorf("expected object key to be %v, instead got %v", obj, *res.Key)
+		}
+		if *res.Bucket != bucket {
+			return fmt.Errorf("expected the bucket name to be %v, instead got %v", bucket, *res.Bucket)
+		}
+		if res.ETag == nil || *res.ETag == "" {
+			return fmt.Errorf("expected non-empty ETag")
+		}
+		if res.VersionId == nil || *res.VersionId == "" {
+			return fmt.Errorf("expected non-empty versionId")
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		resp, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: res.VersionId,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *resp.ETag != *res.ETag {
+			return fmt.Errorf("expected the uploaded object etag to be %v, instead got %v", *res.ETag, *resp.ETag)
+		}
+		if *resp.ContentLength != int64(objSize) {
+			return fmt.Errorf("expected the uploaded object size to be %v, instead got %v", objSize, resp.ContentLength)
+		}
+		if *resp.VersionId != *res.VersionId {
+			return fmt.Errorf("expected the versionId to be %v, instead got %v", *res.VersionId, *resp.VersionId)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_Multipart_Upload_overwrite_an_object(s *S3Conf) error {
+	testName := "Versioning_Multipart_Upload_overwrite_an_object"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+
+		objVersions, err := createObjVersions(s3client, bucket, obj, 2)
+		if err != nil {
+			return err
+		}
+		out, err := createMp(s3client, bucket, obj)
+		if err != nil {
+			return err
+		}
+
+		objSize := int64(5 * 1024 * 1024)
+		parts, _, err := uploadParts(s3client, objSize, 5, bucket, obj, *out.UploadId)
+		if err != nil {
+			return err
+		}
+
+		compParts := []types.CompletedPart{}
+		for _, el := range parts {
+			compParts = append(compParts, types.CompletedPart{
+				ETag:       el.ETag,
+				PartNumber: el.PartNumber,
+			})
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:   &bucket,
+			Key:      &obj,
+			UploadId: out.UploadId,
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: compParts,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *res.Key != obj {
+			return fmt.Errorf("expected object key to be %v, instead got %v", obj, *res.Key)
+		}
+		if *res.Bucket != bucket {
+			return fmt.Errorf("expected the bucket name to be %v, instead got %v", bucket, *res.Bucket)
+		}
+		if res.ETag == nil || *res.ETag == "" {
+			return fmt.Errorf("expected non-empty ETag")
+		}
+		if res.VersionId == nil || *res.VersionId == "" {
+			return fmt.Errorf("expected non-empty versionId")
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		resp, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		size := int64(objSize)
+
+		objVersions[0].IsLatest = getBoolPtr(false)
+		versions := append([]types.ObjectVersion{
+			{
+				Key:          &obj,
+				VersionId:    res.VersionId,
+				ETag:         res.ETag,
+				IsLatest:     getBoolPtr(true),
+				Size:         &size,
+				StorageClass: types.ObjectVersionStorageClassStandard,
+			},
+		}, objVersions...)
+
+		if !compareVersions(resp.Versions, versions) {
+			return fmt.Errorf("expected the resulting versions to be %v, instead got %v", versions, resp.Versions)
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_UploadPartCopy_non_existing_versionId(s *S3Conf) error {
+	testName := "Versioning_UploadPartCopy_non_existing_versionId"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		dstBucket, dstObj, srcObj := getBucketName(), "dst-obj", "src-obj"
+
+		lgth := int64(100)
+		_, err := putObjectWithData(lgth, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &srcObj,
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		if err := setup(s, dstBucket); err != nil {
+			return err
+		}
+
+		mp, err := createMp(s3client, dstBucket, dstObj)
+		if err != nil {
+			return err
+		}
+
+		pNumber := int32(1)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+			Bucket:     &dstBucket,
+			Key:        &dstObj,
+			UploadId:   mp.UploadId,
+			PartNumber: &pNumber,
+			CopySource: getPtr(fmt.Sprintf("%v/%v?versionId=invalid_versionId", bucket, srcObj)),
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchVersion)); err != nil {
+			return err
+		}
+
+		if err := teardown(s, dstBucket); err != nil {
+			return err
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_UploadPartCopy_from_an_object_version(s *S3Conf) error {
+	testName := "Versioning_UploadPartCopy_from_an_object_version"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		srcObj, dstBucket, obj := "my-obj", getBucketName(), "dst-obj"
+		err := setup(s, dstBucket)
+		if err != nil {
+			return err
+		}
+
+		srcObjVersions, err := createObjVersions(s3client, bucket, srcObj, 1)
+		if err != nil {
+			return err
+		}
+		srcObjVersion := srcObjVersions[0]
+
+		out, err := createMp(s3client, dstBucket, obj)
+		if err != nil {
+			return err
+		}
+
+		partNumber := int32(1)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		copyOut, err := s3client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+			Bucket:     &dstBucket,
+			CopySource: getPtr(fmt.Sprintf("%v/%v?versionId=%v", bucket, srcObj, *srcObjVersion.VersionId)),
+			UploadId:   out.UploadId,
+			Key:        &obj,
+			PartNumber: &partNumber,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if *copyOut.CopySourceVersionId != *srcObjVersion.VersionId {
+			return fmt.Errorf("expected the copy-source-version-id to be %v, instead got %v", *srcObjVersion.VersionId, *copyOut.CopySourceVersionId)
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListParts(ctx, &s3.ListPartsInput{
+			Bucket:   &dstBucket,
+			Key:      &obj,
+			UploadId: out.UploadId,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if len(res.Parts) != 1 {
+			return fmt.Errorf("expected parts to be 1, instead got %v", len(res.Parts))
+		}
+		if *res.Parts[0].PartNumber != partNumber {
+			return fmt.Errorf("expected part-number to be %v, instead got %v", partNumber, res.Parts[0].PartNumber)
+		}
+		if *res.Parts[0].Size != *srcObjVersion.Size {
+			return fmt.Errorf("expected part size to be %v, instead got %v", *srcObjVersion.Size, res.Parts[0].Size)
+		}
+		if *res.Parts[0].ETag != *copyOut.CopyPartResult.ETag {
+			return fmt.Errorf("expected part etag to be %v, instead got %v", *copyOut.CopyPartResult.ETag, *res.Parts[0].ETag)
+		}
+
+		if err := teardown(s, dstBucket); err != nil {
+			return err
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_Enable_object_lock(s *S3Conf) error {
+	testName := "Versioning_Enable_object_lock"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if res.Status != types.BucketVersioningStatusEnabled {
+			return fmt.Errorf("expected the bucket versioning status to be %v, instead got %v", types.BucketVersioningStatusEnabled, res.Status)
+		}
+
+		return nil
+	}, withLock())
+}
+
+func Versioning_status_switch_to_suspended_with_object_lock(s *S3Conf) error {
+	testName := "Versioning_status_switch_to_suspended_with_object_lock"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		err := putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusSuspended)
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrSuspendedVersioningNotAllowed)); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock())
+}
+
+func Versioning_PutObjectRetention_invalid_versionId(s *S3Conf) error {
+	testName := "Versioning_PutObjectRetention_invalid_versionId"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := createObjVersions(s3client, bucket, obj, 3)
+		if err != nil {
+			return err
+		}
+
+		rDate := time.Now().Add(time.Hour * 48)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: getPtr("invalid_versionId"),
+			Retention: &types.ObjectLockRetention{
+				Mode:            types.ObjectLockRetentionModeGovernance,
+				RetainUntilDate: &rDate,
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidVersionId)); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock(), withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_GetObjectRetention_invalid_versionId(s *S3Conf) error {
+	testName := "Versioning_GetObjectRetention_invalid_versionId"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := createObjVersions(s3client, bucket, obj, 3)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObjectRetention(ctx, &s3.GetObjectRetentionInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: getPtr("invalid_versionId"),
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidVersionId)); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock(), withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_Put_GetObjectRetention_success(s *S3Conf) error {
+	testName := "Versioning_Put_GetObjectRetention_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		objVersions, err := createObjVersions(s3client, bucket, obj, 3)
+		if err != nil {
+			return err
+		}
+		objVersion := objVersions[1]
+
+		rDate := time.Now().Add(time.Hour * 48)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: objVersion.VersionId,
+			Retention: &types.ObjectLockRetention{
+				Mode:            types.ObjectLockRetentionModeGovernance,
+				RetainUntilDate: &rDate,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.GetObjectRetention(ctx, &s3.GetObjectRetentionInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: objVersion.VersionId,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if res.Retention.Mode != types.ObjectLockRetentionModeGovernance {
+			return fmt.Errorf("expected the object retention mode to be %v, instead got %v", types.ObjectLockRetentionModeGovernance, res.Retention.Mode)
+		}
+
+		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock(), withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_PutObjectLegalHold_invalid_versionId(s *S3Conf) error {
+	testName := "Versioning_PutObjectLegalHold_invalid_versionId"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := createObjVersions(s3client, bucket, obj, 3)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: getPtr("invalid_versionId"),
+			LegalHold: &types.ObjectLockLegalHold{
+				Status: types.ObjectLockLegalHoldStatusOn,
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidVersionId)); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock(), withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_GetObjectLegalHold_invalid_versionId(s *S3Conf) error {
+	testName := "Versioning_GetObjectLegalHold_invalid_versionId"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		_, err := createObjVersions(s3client, bucket, obj, 3)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.GetObjectLegalHold(ctx, &s3.GetObjectLegalHoldInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: getPtr("invalid_versionId"),
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrInvalidVersionId)); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock(), withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_Put_GetObjectLegalHold_success(s *S3Conf) error {
+	testName := "Versioning_Put_GetObjectLegalHold_success"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		objVersions, err := createObjVersions(s3client, bucket, obj, 3)
+		if err != nil {
+			return err
+		}
+		objVersion := objVersions[1]
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: objVersion.VersionId,
+			LegalHold: &types.ObjectLockLegalHold{
+				Status: types.ObjectLockLegalHoldStatusOn,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.GetObjectLegalHold(ctx, &s3.GetObjectLegalHoldInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: objVersion.VersionId,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if res.LegalHold.Status != types.ObjectLockLegalHoldStatusOn {
+			return fmt.Errorf("expected the object version legal hold status to be %v, instead got %v", types.ObjectLockLegalHoldStatusOn, res.LegalHold.Status)
+		}
+
+		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock(), withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_WORM_obj_version_locked_with_legal_hold(s *S3Conf) error {
+	testName := "Versioning_WORM_obj_version_locked_with_legal_hold"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		objVersions, err := createObjVersions(s3client, bucket, obj, 2)
+		if err != nil {
+			return err
+		}
+		version := objVersions[1]
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: version.VersionId,
+			LegalHold: &types.ObjectLockLegalHold{
+				Status: types.ObjectLockLegalHoldStatusOn,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: version.VersionId,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLocked)); err != nil {
+			return err
+		}
+
+		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock(), withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_WORM_obj_version_locked_with_governance_retention(s *S3Conf) error {
+	testName := "Versioning_WORM_obj_version_locked_with_governance_retention"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		objVersions, err := createObjVersions(s3client, bucket, obj, 2)
+		if err != nil {
+			return err
+		}
+		version := objVersions[0]
+
+		rDate := time.Now().Add(time.Hour * 48)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: version.VersionId,
+			Retention: &types.ObjectLockRetention{
+				Mode:            types.ObjectLockRetentionModeGovernance,
+				RetainUntilDate: &rDate,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: version.VersionId,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLocked)); err != nil {
+			return err
+		}
+
+		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock(), withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func Versioning_WORM_obj_version_locked_with_compliance_retention(s *S3Conf) error {
+	testName := "Versioning_WORM_obj_version_locked_with_compliance_retention"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		objVersions, err := createObjVersions(s3client, bucket, obj, 2)
+		if err != nil {
+			return err
+		}
+		version := objVersions[0]
+
+		rDate := time.Now().Add(time.Hour * 48)
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: version.VersionId,
+			Retention: &types.ObjectLockRetention{
+				Mode:            types.ObjectLockRetentionModeCompliance,
+				RetainUntilDate: &rDate,
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket:    &bucket,
+			Key:       &obj,
+			VersionId: version.VersionId,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLocked)); err != nil {
+			return err
+		}
+
+		if err := changeBucketObjectLockStatus(s3client, bucket, false); err != nil {
+			return err
+		}
+
+		return nil
+	}, withLock(), withVersioning(types.BucketVersioningStatusEnabled))
+}
+
+func VersioningDisabled_GetBucketVersioning_not_configured(s *S3Conf) error {
+	testName := "VersioningDisabled_GetBucketVersioning_not_configured"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		err := putBucketVersioningStatus(s3client, bucket, types.BucketVersioningStatusEnabled)
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrVersioningNotConfigured)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func VersioningDisabled_PutBucketVersioning_not_configured(s *S3Conf) error {
+	testName := "VersioningDisabled_PutBucketVersioning_not_configured"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err := s3client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrVersioningNotConfigured)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func Versioning_concurrent_upload_object(s *S3Conf) error {
+	testName := "Versioninig_concurrent_upload_object"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		versionCount := 5
+		// Channel to collect errors
+		errCh := make(chan error, versionCount)
+
+		uploadVersion := func(wg *sync.WaitGroup) {
+			defer wg.Done()
+
+			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+			res, err := s3client.PutObject(ctx, &s3.PutObjectInput{
+				Bucket: &bucket,
+				Key:    &obj,
+			})
+			cancel()
+			if err != nil {
+				// Send error to the channel
+				errCh <- err
+				return
+			}
+
+			fmt.Printf("uploaded object successfully: versionId: %v\n", *res.VersionId)
+		}
+
+		wg := &sync.WaitGroup{}
+		wg.Add(versionCount)
+
+		for i := 0; i < versionCount; i++ {
+			go uploadVersion(wg)
+		}
+
+		wg.Wait()
+		close(errCh)
+
+		// Check if there were any errors
+		for err := range errCh {
+			if err != nil {
+				fmt.Printf("error uploading an object: %v\n", err.Error())
+				return err
+			}
+		}
+
+		// List object versions after all uploads
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		res, err := s3client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: &bucket,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if len(res.Versions) != versionCount {
+			return fmt.Errorf("expected %v object versions, instead got %v", versionCount, len(res.Versions))
+		}
+
+		return nil
+	}, withVersioning(types.BucketVersioningStatusEnabled))
 }

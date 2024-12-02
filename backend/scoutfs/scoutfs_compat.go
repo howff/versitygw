@@ -23,7 +23,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 
@@ -35,9 +34,13 @@ import (
 )
 
 func New(rootdir string, opts ScoutfsOpts) (*ScoutFS, error) {
-	p, err := posix.New(rootdir, meta.XattrMeta{}, posix.PosixOpts{
-		ChownUID: opts.ChownUID,
-		ChownGID: opts.ChownGID,
+	metastore := meta.XattrMeta{}
+
+	p, err := posix.New(rootdir, metastore, posix.PosixOpts{
+		ChownUID:    opts.ChownUID,
+		ChownGID:    opts.ChownGID,
+		BucketLinks: opts.BucketLinks,
+		NewDirPerm:  opts.NewDirPerm,
 	})
 	if err != nil {
 		return nil, err
@@ -49,11 +52,14 @@ func New(rootdir string, opts ScoutfsOpts) (*ScoutFS, error) {
 	}
 
 	return &ScoutFS{
-		Posix:    p,
-		rootfd:   f,
-		rootdir:  rootdir,
-		chownuid: opts.ChownUID,
-		chowngid: opts.ChownGID,
+		Posix:       p,
+		rootfd:      f,
+		rootdir:     rootdir,
+		meta:        metastore,
+		chownuid:    opts.ChownUID,
+		chowngid:    opts.ChownGID,
+		glaciermode: opts.GlacierMode,
+		newDirPerm:  opts.NewDirPerm,
 	}, nil
 }
 
@@ -67,10 +73,10 @@ type tmpfile struct {
 	needsChown bool
 	uid        int
 	gid        int
+	newDirPerm fs.FileMode
 }
 
 var (
-	// TODO: make this configurable
 	defaultFilePerm uint32 = 0644
 )
 
@@ -98,11 +104,7 @@ func (s *ScoutFS) openTmpFile(dir, bucket, obj string, size int64, acct auth.Acc
 		needsChown: doChown,
 		uid:        uid,
 		gid:        gid,
-	}
-
-	// falloc is best effort, its fine if this fails
-	if size > 0 {
-		tmp.falloc()
+		newDirPerm: s.newDirPerm,
 	}
 
 	if doChown {
@@ -113,14 +115,6 @@ func (s *ScoutFS) openTmpFile(dir, bucket, obj string, size int64, acct auth.Acc
 	}
 
 	return tmp, nil
-}
-
-func (tmp *tmpfile) falloc() error {
-	err := syscall.Fallocate(int(tmp.f.Fd()), 0, 0, tmp.size)
-	if err != nil {
-		return fmt.Errorf("fallocate: %v", err)
-	}
-	return nil
 }
 
 func (tmp *tmpfile) link() error {
@@ -138,7 +132,7 @@ func (tmp *tmpfile) link() error {
 
 	dir := filepath.Dir(objPath)
 
-	err = backend.MkdirAll(dir, tmp.uid, tmp.gid, tmp.needsChown)
+	err = backend.MkdirAll(dir, tmp.uid, tmp.gid, tmp.needsChown, tmp.newDirPerm)
 	if err != nil {
 		return fmt.Errorf("make parent dir: %w", err)
 	}
@@ -181,6 +175,10 @@ func (tmp *tmpfile) Write(b []byte) (int, error) {
 
 func (tmp *tmpfile) cleanup() {
 	tmp.f.Close()
+}
+
+func (tmp *tmpfile) File() *os.File {
+	return tmp.f
 }
 
 func moveData(from *os.File, to *os.File) error {

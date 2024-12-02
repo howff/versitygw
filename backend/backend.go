@@ -18,9 +18,9 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 	"github.com/versity/versitygw/s3select"
@@ -32,20 +32,23 @@ type Backend interface {
 	Shutdown()
 
 	// bucket operations
-	ListBuckets(_ context.Context, owner string, isAdmin bool) (s3response.ListAllMyBucketsResult, error)
+	ListBuckets(context.Context, s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error)
 	HeadBucket(context.Context, *s3.HeadBucketInput) (*s3.HeadBucketOutput, error)
 	GetBucketAcl(context.Context, *s3.GetBucketAclInput) ([]byte, error)
 	CreateBucket(_ context.Context, _ *s3.CreateBucketInput, defaultACL []byte) error
 	PutBucketAcl(_ context.Context, bucket string, data []byte) error
-	DeleteBucket(context.Context, *s3.DeleteBucketInput) error
-	PutBucketVersioning(context.Context, *s3.PutBucketVersioningInput) error
-	GetBucketVersioning(_ context.Context, bucket string) (*s3.GetBucketVersioningOutput, error)
+	DeleteBucket(_ context.Context, bucket string) error
+	PutBucketVersioning(_ context.Context, bucket string, status types.BucketVersioningStatus) error
+	GetBucketVersioning(_ context.Context, bucket string) (s3response.GetBucketVersioningOutput, error)
 	PutBucketPolicy(_ context.Context, bucket string, policy []byte) error
 	GetBucketPolicy(_ context.Context, bucket string) ([]byte, error)
 	DeleteBucketPolicy(_ context.Context, bucket string) error
+	PutBucketOwnershipControls(_ context.Context, bucket string, ownership types.ObjectOwnership) error
+	GetBucketOwnershipControls(_ context.Context, bucket string) (types.ObjectOwnership, error)
+	DeleteBucketOwnershipControls(_ context.Context, bucket string) error
 
 	// multipart operations
-	CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput) (*s3.CreateMultipartUploadOutput, error)
+	CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput) (s3response.InitiateMultipartUploadResult, error)
 	CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput) (*s3.CompleteMultipartUploadOutput, error)
 	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput) error
 	ListMultipartUploads(context.Context, *s3.ListMultipartUploadsInput) (s3response.ListMultipartUploadsResult, error)
@@ -54,18 +57,18 @@ type Backend interface {
 	UploadPartCopy(context.Context, *s3.UploadPartCopyInput) (s3response.CopyObjectResult, error)
 
 	// standard object operations
-	PutObject(context.Context, *s3.PutObjectInput) (string, error)
+	PutObject(context.Context, *s3.PutObjectInput) (s3response.PutObjectOutput, error)
 	HeadObject(context.Context, *s3.HeadObjectInput) (*s3.HeadObjectOutput, error)
-	GetObject(context.Context, *s3.GetObjectInput, io.Writer) (*s3.GetObjectOutput, error)
+	GetObject(context.Context, *s3.GetObjectInput) (*s3.GetObjectOutput, error)
 	GetObjectAcl(context.Context, *s3.GetObjectAclInput) (*s3.GetObjectAclOutput, error)
-	GetObjectAttributes(context.Context, *s3.GetObjectAttributesInput) (*s3.GetObjectAttributesOutput, error)
+	GetObjectAttributes(context.Context, *s3.GetObjectAttributesInput) (s3response.GetObjectAttributesResponse, error)
 	CopyObject(context.Context, *s3.CopyObjectInput) (*s3.CopyObjectOutput, error)
-	ListObjects(context.Context, *s3.ListObjectsInput) (*s3.ListObjectsOutput, error)
-	ListObjectsV2(context.Context, *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error)
-	DeleteObject(context.Context, *s3.DeleteObjectInput) error
+	ListObjects(context.Context, *s3.ListObjectsInput) (s3response.ListObjectsResult, error)
+	ListObjectsV2(context.Context, *s3.ListObjectsV2Input) (s3response.ListObjectsV2Result, error)
+	DeleteObject(context.Context, *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error)
 	DeleteObjects(context.Context, *s3.DeleteObjectsInput) (s3response.DeleteResult, error)
 	PutObjectAcl(context.Context, *s3.PutObjectAclInput) error
-	ListObjectVersions(context.Context, *s3.ListObjectVersionsInput) (*s3.ListObjectVersionsOutput, error)
+	ListObjectVersions(context.Context, *s3.ListObjectVersionsInput) (s3response.ListVersionsResult, error)
 
 	// special case object operations
 	RestoreObject(context.Context, *s3.RestoreObjectInput) error
@@ -84,13 +87,13 @@ type Backend interface {
 	// object lock operations
 	PutObjectLockConfiguration(_ context.Context, bucket string, config []byte) error
 	GetObjectLockConfiguration(_ context.Context, bucket string) ([]byte, error)
-	PutObjectRetention(_ context.Context, bucket, object, versionId string, retention []byte) error
+	PutObjectRetention(_ context.Context, bucket, object, versionId string, bypass bool, retention []byte) error
 	GetObjectRetention(_ context.Context, bucket, object, versionId string) ([]byte, error)
 	PutObjectLegalHold(_ context.Context, bucket, object, versionId string, status bool) error
 	GetObjectLegalHold(_ context.Context, bucket, object, versionId string) (*bool, error)
 
 	// non AWS actions
-	ChangeBucketOwner(_ context.Context, bucket, newOwner string) error
+	ChangeBucketOwner(_ context.Context, bucket string, acl []byte) error
 	ListBucketsAndOwners(context.Context) ([]s3response.Bucket, error)
 }
 
@@ -105,7 +108,7 @@ func (BackendUnsupported) Shutdown() {}
 func (BackendUnsupported) String() string {
 	return "Unsupported"
 }
-func (BackendUnsupported) ListBuckets(context.Context, string, bool) (s3response.ListAllMyBucketsResult, error) {
+func (BackendUnsupported) ListBuckets(context.Context, s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
 	return s3response.ListAllMyBucketsResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
 func (BackendUnsupported) HeadBucket(context.Context, *s3.HeadBucketInput) (*s3.HeadBucketOutput, error) {
@@ -120,14 +123,14 @@ func (BackendUnsupported) CreateBucket(context.Context, *s3.CreateBucketInput, [
 func (BackendUnsupported) PutBucketAcl(_ context.Context, bucket string, data []byte) error {
 	return s3err.GetAPIError(s3err.ErrNotImplemented)
 }
-func (BackendUnsupported) DeleteBucket(context.Context, *s3.DeleteBucketInput) error {
+func (BackendUnsupported) DeleteBucket(_ context.Context, bucket string) error {
 	return s3err.GetAPIError(s3err.ErrNotImplemented)
 }
-func (BackendUnsupported) PutBucketVersioning(context.Context, *s3.PutBucketVersioningInput) error {
+func (BackendUnsupported) PutBucketVersioning(_ context.Context, bucket string, status types.BucketVersioningStatus) error {
 	return s3err.GetAPIError(s3err.ErrNotImplemented)
 }
-func (BackendUnsupported) GetBucketVersioning(_ context.Context, bucket string) (*s3.GetBucketVersioningOutput, error) {
-	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
+func (BackendUnsupported) GetBucketVersioning(_ context.Context, bucket string) (s3response.GetBucketVersioningOutput, error) {
+	return s3response.GetBucketVersioningOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
 func (BackendUnsupported) PutBucketPolicy(_ context.Context, bucket string, policy []byte) error {
 	return s3err.GetAPIError(s3err.ErrNotImplemented)
@@ -138,9 +141,18 @@ func (BackendUnsupported) GetBucketPolicy(_ context.Context, bucket string) ([]b
 func (BackendUnsupported) DeleteBucketPolicy(_ context.Context, bucket string) error {
 	return s3err.GetAPIError(s3err.ErrNotImplemented)
 }
+func (BackendUnsupported) PutBucketOwnershipControls(_ context.Context, bucket string, ownership types.ObjectOwnership) error {
+	return s3err.GetAPIError(s3err.ErrNotImplemented)
+}
+func (BackendUnsupported) GetBucketOwnershipControls(_ context.Context, bucket string) (types.ObjectOwnership, error) {
+	return types.ObjectOwnershipBucketOwnerEnforced, s3err.GetAPIError(s3err.ErrNotImplemented)
+}
+func (BackendUnsupported) DeleteBucketOwnershipControls(_ context.Context, bucket string) error {
+	return s3err.GetAPIError(s3err.ErrNotImplemented)
+}
 
-func (BackendUnsupported) CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput) (*s3.CreateMultipartUploadOutput, error) {
-	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
+func (BackendUnsupported) CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput) (s3response.InitiateMultipartUploadResult, error) {
+	return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
 func (BackendUnsupported) CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput) (*s3.CompleteMultipartUploadOutput, error) {
 	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
@@ -161,32 +173,32 @@ func (BackendUnsupported) UploadPartCopy(context.Context, *s3.UploadPartCopyInpu
 	return s3response.CopyObjectResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
 
-func (BackendUnsupported) PutObject(context.Context, *s3.PutObjectInput) (string, error) {
-	return "", s3err.GetAPIError(s3err.ErrNotImplemented)
+func (BackendUnsupported) PutObject(context.Context, *s3.PutObjectInput) (s3response.PutObjectOutput, error) {
+	return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
 func (BackendUnsupported) HeadObject(context.Context, *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
 	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
-func (BackendUnsupported) GetObject(context.Context, *s3.GetObjectInput, io.Writer) (*s3.GetObjectOutput, error) {
+func (BackendUnsupported) GetObject(context.Context, *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
 	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
 func (BackendUnsupported) GetObjectAcl(context.Context, *s3.GetObjectAclInput) (*s3.GetObjectAclOutput, error) {
 	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
-func (BackendUnsupported) GetObjectAttributes(context.Context, *s3.GetObjectAttributesInput) (*s3.GetObjectAttributesOutput, error) {
-	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
+func (BackendUnsupported) GetObjectAttributes(context.Context, *s3.GetObjectAttributesInput) (s3response.GetObjectAttributesResponse, error) {
+	return s3response.GetObjectAttributesResponse{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
 func (BackendUnsupported) CopyObject(context.Context, *s3.CopyObjectInput) (*s3.CopyObjectOutput, error) {
 	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
-func (BackendUnsupported) ListObjects(context.Context, *s3.ListObjectsInput) (*s3.ListObjectsOutput, error) {
-	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
+func (BackendUnsupported) ListObjects(context.Context, *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
+	return s3response.ListObjectsResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
-func (BackendUnsupported) ListObjectsV2(context.Context, *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
-	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
+func (BackendUnsupported) ListObjectsV2(context.Context, *s3.ListObjectsV2Input) (s3response.ListObjectsV2Result, error) {
+	return s3response.ListObjectsV2Result{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
-func (BackendUnsupported) DeleteObject(context.Context, *s3.DeleteObjectInput) error {
-	return s3err.GetAPIError(s3err.ErrNotImplemented)
+func (BackendUnsupported) DeleteObject(context.Context, *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
+	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
 func (BackendUnsupported) DeleteObjects(context.Context, *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
 	return s3response.DeleteResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
@@ -213,8 +225,8 @@ func (BackendUnsupported) SelectObjectContent(ctx context.Context, input *s3.Sel
 	}
 }
 
-func (BackendUnsupported) ListObjectVersions(context.Context, *s3.ListObjectVersionsInput) (*s3.ListObjectVersionsOutput, error) {
-	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
+func (BackendUnsupported) ListObjectVersions(context.Context, *s3.ListObjectVersionsInput) (s3response.ListVersionsResult, error) {
+	return s3response.ListVersionsResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
 
 func (BackendUnsupported) GetBucketTagging(_ context.Context, bucket string) (map[string]string, error) {
@@ -243,7 +255,7 @@ func (BackendUnsupported) PutObjectLockConfiguration(_ context.Context, bucket s
 func (BackendUnsupported) GetObjectLockConfiguration(_ context.Context, bucket string) ([]byte, error) {
 	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
-func (BackendUnsupported) PutObjectRetention(_ context.Context, bucket, object, versionId string, retention []byte) error {
+func (BackendUnsupported) PutObjectRetention(_ context.Context, bucket, object, versionId string, bypass bool, retention []byte) error {
 	return s3err.GetAPIError(s3err.ErrNotImplemented)
 }
 func (BackendUnsupported) GetObjectRetention(_ context.Context, bucket, object, versionId string) ([]byte, error) {
@@ -256,7 +268,7 @@ func (BackendUnsupported) GetObjectLegalHold(_ context.Context, bucket, object, 
 	return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
 }
 
-func (BackendUnsupported) ChangeBucketOwner(_ context.Context, bucket, newOwner string) error {
+func (BackendUnsupported) ChangeBucketOwner(_ context.Context, bucket string, acl []byte) error {
 	return s3err.GetAPIError(s3err.ErrNotImplemented)
 }
 func (BackendUnsupported) ListBucketsAndOwners(context.Context) ([]s3response.Bucket, error) {

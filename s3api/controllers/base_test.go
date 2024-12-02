@@ -19,7 +19,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -77,7 +76,7 @@ func TestNew(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := New(tt.args.be, tt.args.iam, nil, nil, false)
+			got := New(tt.args.be, tt.args.iam, nil, nil, nil, false, false)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("New() = %v, want %v", got, tt.want)
 			}
@@ -93,7 +92,7 @@ func TestS3ApiController_ListBuckets(t *testing.T) {
 	app := fiber.New()
 	s3ApiController := S3ApiController{
 		be: &BackendMock{
-			ListBucketsFunc: func(context.Context, string, bool) (s3response.ListAllMyBucketsResult, error) {
+			ListBucketsFunc: func(contextMoqParam context.Context, listBucketsInput s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
 				return s3response.ListAllMyBucketsResult{}, nil
 			},
 		},
@@ -110,7 +109,7 @@ func TestS3ApiController_ListBuckets(t *testing.T) {
 	appErr := fiber.New()
 	s3ApiControllerErr := S3ApiController{
 		be: &BackendMock{
-			ListBucketsFunc: func(context.Context, string, bool) (s3response.ListAllMyBucketsResult, error) {
+			ListBucketsFunc: func(contextMoqParam context.Context, listBucketsInput s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
 				return s3response.ListAllMyBucketsResult{}, s3err.GetAPIError(s3err.ErrMethodNotAllowed)
 			},
 		},
@@ -188,10 +187,10 @@ func TestS3ApiController_GetActions(t *testing.T) {
 			GetObjectAclFunc: func(context.Context, *s3.GetObjectAclInput) (*s3.GetObjectAclOutput, error) {
 				return &s3.GetObjectAclOutput{}, nil
 			},
-			GetObjectAttributesFunc: func(context.Context, *s3.GetObjectAttributesInput) (*s3.GetObjectAttributesOutput, error) {
-				return &s3.GetObjectAttributesOutput{}, nil
+			GetObjectAttributesFunc: func(context.Context, *s3.GetObjectAttributesInput) (s3response.GetObjectAttributesResponse, error) {
+				return s3response.GetObjectAttributesResponse{}, nil
 			},
-			GetObjectFunc: func(context.Context, *s3.GetObjectInput, io.Writer) (*s3.GetObjectOutput, error) {
+			GetObjectFunc: func(context.Context, *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
 				return &s3.GetObjectOutput{
 					Metadata:        map[string]string{"hello": "world"},
 					ContentType:     getPtr("application/xml"),
@@ -374,26 +373,29 @@ func TestS3ApiController_ListActions(t *testing.T) {
 			ListMultipartUploadsFunc: func(_ context.Context, output *s3.ListMultipartUploadsInput) (s3response.ListMultipartUploadsResult, error) {
 				return s3response.ListMultipartUploadsResult{}, nil
 			},
-			ListObjectsV2Func: func(context.Context, *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
-				return &s3.ListObjectsV2Output{}, nil
+			ListObjectsV2Func: func(context.Context, *s3.ListObjectsV2Input) (s3response.ListObjectsV2Result, error) {
+				return s3response.ListObjectsV2Result{}, nil
 			},
-			ListObjectsFunc: func(context.Context, *s3.ListObjectsInput) (*s3.ListObjectsOutput, error) {
-				return &s3.ListObjectsOutput{}, nil
+			ListObjectsFunc: func(context.Context, *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
+				return s3response.ListObjectsResult{}, nil
 			},
 			GetBucketTaggingFunc: func(contextMoqParam context.Context, bucket string) (map[string]string, error) {
 				return map[string]string{}, nil
 			},
-			GetBucketVersioningFunc: func(contextMoqParam context.Context, bucket string) (*s3.GetBucketVersioningOutput, error) {
-				return &s3.GetBucketVersioningOutput{}, nil
+			GetBucketVersioningFunc: func(contextMoqParam context.Context, bucket string) (s3response.GetBucketVersioningOutput, error) {
+				return s3response.GetBucketVersioningOutput{}, nil
 			},
-			ListObjectVersionsFunc: func(contextMoqParam context.Context, listObjectVersionsInput *s3.ListObjectVersionsInput) (*s3.ListObjectVersionsOutput, error) {
-				return &s3.ListObjectVersionsOutput{}, nil
+			ListObjectVersionsFunc: func(contextMoqParam context.Context, listObjectVersionsInput *s3.ListObjectVersionsInput) (s3response.ListVersionsResult, error) {
+				return s3response.ListVersionsResult{}, nil
 			},
 			GetBucketPolicyFunc: func(contextMoqParam context.Context, bucket string) ([]byte, error) {
 				return []byte{}, nil
 			},
 			GetObjectLockConfigurationFunc: func(contextMoqParam context.Context, bucket string) ([]byte, error) {
 				return objectLockResult, nil
+			},
+			GetBucketOwnershipControlsFunc: func(contextMoqParam context.Context, bucket string) (types.ObjectOwnership, error) {
+				return types.ObjectOwnershipBucketOwnerEnforced, nil
 			},
 		},
 	}
@@ -414,8 +416,8 @@ func TestS3ApiController_ListActions(t *testing.T) {
 			GetBucketAclFunc: func(context.Context, *s3.GetBucketAclInput) ([]byte, error) {
 				return acldata, nil
 			},
-			ListObjectsFunc: func(context.Context, *s3.ListObjectsInput) (*s3.ListObjectsOutput, error) {
-				return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
+			ListObjectsFunc: func(context.Context, *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
+				return s3response.ListObjectsResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 			},
 			GetBucketTaggingFunc: func(contextMoqParam context.Context, bucket string) (map[string]string, error) {
 				return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
@@ -447,6 +449,15 @@ func TestS3ApiController_ListActions(t *testing.T) {
 			},
 			wantErr:    false,
 			statusCode: 404,
+		},
+		{
+			name: "Get-bucket-ownership-control-success",
+			app:  app,
+			args: args{
+				req: httptest.NewRequest(http.MethodGet, "/my-bucket?ownershipControls", nil),
+			},
+			wantErr:    false,
+			statusCode: 200,
 		},
 		{
 			name: "Get-bucket-tagging-success",
@@ -562,7 +573,7 @@ func TestS3ApiController_PutBucketActions(t *testing.T) {
 	app := fiber.New()
 
 	// Mock valid acl
-	acl := auth.ACL{Owner: "valid access", ACL: "public-read-write"}
+	acl := auth.ACL{Owner: "valid access"}
 	acldata, err := json.Marshal(acl)
 	if err != nil {
 		t.Errorf("Failed to parse the params: %v", err.Error())
@@ -589,14 +600,6 @@ func TestS3ApiController_PutBucketActions(t *testing.T) {
 	<AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
 		<Owner>
 			<ID>hello</ID>
-		</Owner>
-	</AccessControlPolicy>
-	`
-
-	succBody := `
-	<AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-		<Owner>
-			<ID>valid access</ID>
 		</Owner>
 	</AccessControlPolicy>
 	`
@@ -644,6 +647,22 @@ func TestS3ApiController_PutBucketActions(t *testing.T) {
 	</ObjectLockConfiguration>
 	`
 
+	ownershipBody := `
+	<OwnershipControls xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+		<Rule>
+			<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>
+		</Rule>
+	</OwnershipControls>
+	`
+
+	invalidOwnershipBody := `
+	<OwnershipControls xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+		<Rule>
+			<ObjectOwnership>invalid_value</ObjectOwnership>
+		</Rule>
+	</OwnershipControls>
+	`
+
 	s3ApiController := S3ApiController{
 		be: &BackendMock{
 			GetBucketAclFunc: func(context.Context, *s3.GetBucketAclInput) ([]byte, error) {
@@ -658,7 +677,7 @@ func TestS3ApiController_PutBucketActions(t *testing.T) {
 			PutBucketTaggingFunc: func(contextMoqParam context.Context, bucket string, tags map[string]string) error {
 				return nil
 			},
-			PutBucketVersioningFunc: func(contextMoqParam context.Context, putBucketVersioningInput *s3.PutBucketVersioningInput) error {
+			PutBucketVersioningFunc: func(contextMoqParam context.Context, bucket string, status types.BucketVersioningStatus) error {
 				return nil
 			},
 			PutBucketPolicyFunc: func(contextMoqParam context.Context, bucket string, policy []byte) error {
@@ -666,6 +685,12 @@ func TestS3ApiController_PutBucketActions(t *testing.T) {
 			},
 			PutObjectLockConfigurationFunc: func(contextMoqParam context.Context, bucket string, config []byte) error {
 				return nil
+			},
+			PutBucketOwnershipControlsFunc: func(contextMoqParam context.Context, bucket string, ownership types.ObjectOwnership) error {
+				return nil
+			},
+			GetBucketOwnershipControlsFunc: func(contextMoqParam context.Context, bucket string) (types.ObjectOwnership, error) {
+				return types.ObjectOwnershipBucketOwnerPreferred, nil
 			},
 		},
 	}
@@ -690,15 +715,17 @@ func TestS3ApiController_PutBucketActions(t *testing.T) {
 
 	// PutBucketAcl incorrect bucket owner case
 	incorrectBucketOwner := httptest.NewRequest(http.MethodPut, "/my-bucket?acl", strings.NewReader(invOwnerBody))
-	incorrectBucketOwner.Header.Set("X-Amz-Acl", "private")
 
 	// PutBucketAcl acl success
-	aclSuccReq := httptest.NewRequest(http.MethodPut, "/my-bucket?acl", strings.NewReader(succBody))
+	aclSuccReq := httptest.NewRequest(http.MethodPut, "/my-bucket?acl", nil)
 	aclSuccReq.Header.Set("X-Amz-Acl", "private")
 
 	// Invalid acl body case
 	errAclBodyReq := httptest.NewRequest(http.MethodPut, "/my-bucket?acl", strings.NewReader(body))
 	errAclBodyReq.Header.Set("X-Amz-Grant-Read", "hello")
+
+	invAclOwnershipReq := httptest.NewRequest(http.MethodPut, "/my-bucket", nil)
+	invAclOwnershipReq.Header.Set("X-Amz-Grant-Read", "hello")
 
 	tests := []struct {
 		name       string
@@ -721,6 +748,24 @@ func TestS3ApiController_PutBucketActions(t *testing.T) {
 			app:  app,
 			args: args{
 				req: httptest.NewRequest(http.MethodPut, "/my-bucket?tagging", strings.NewReader(tagBody)),
+			},
+			wantErr:    false,
+			statusCode: 204,
+		},
+		{
+			name: "Put-bucket-ownership-controls-invalid-ownership",
+			app:  app,
+			args: args{
+				req: httptest.NewRequest(http.MethodPut, "/my-bucket?ownershipControls", strings.NewReader(invalidOwnershipBody)),
+			},
+			wantErr:    false,
+			statusCode: 400,
+		},
+		{
+			name: "Put-bucket-ownership-controls-success",
+			app:  app,
+			args: args{
+				req: httptest.NewRequest(http.MethodPut, "/my-bucket?ownershipControls", strings.NewReader(ownershipBody)),
 			},
 			wantErr:    false,
 			statusCode: 200,
@@ -813,7 +858,7 @@ func TestS3ApiController_PutBucketActions(t *testing.T) {
 				req: incorrectBucketOwner,
 			},
 			wantErr:    false,
-			statusCode: 403,
+			statusCode: 400,
 		},
 		{
 			name: "Put-bucket-acl-success",
@@ -825,7 +870,16 @@ func TestS3ApiController_PutBucketActions(t *testing.T) {
 			statusCode: 200,
 		},
 		{
-			name: "Put-bucket-invalid-bucket-name",
+			name: "Create-bucket-invalid-acl-ownership-combination",
+			app:  app,
+			args: args{
+				req: invAclOwnershipReq,
+			},
+			wantErr:    false,
+			statusCode: 400,
+		},
+		{
+			name: "Create-bucket-invalid-bucket-name",
 			app:  app,
 			args: args{
 				req: httptest.NewRequest(http.MethodPut, "/aa", nil),
@@ -834,7 +888,7 @@ func TestS3ApiController_PutBucketActions(t *testing.T) {
 			statusCode: 400,
 		},
 		{
-			name: "Put-bucket-success",
+			name: "Create-bucket-success",
 			app:  app,
 			args: args{
 				req: httptest.NewRequest(http.MethodPut, "/my-bucket", nil),
@@ -896,7 +950,7 @@ func TestS3ApiController_PutActions(t *testing.T) {
 
 	legalHoldBody := `
 	<LegalHold xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-		<Status>string</Status>
+		<Status>ON</Status>
 	</LegalHold>
 	`
 
@@ -914,8 +968,8 @@ func TestS3ApiController_PutActions(t *testing.T) {
 					CopyObjectResult: &types.CopyObjectResult{},
 				}, nil
 			},
-			PutObjectFunc: func(context.Context, *s3.PutObjectInput) (string, error) {
-				return "ETag", nil
+			PutObjectFunc: func(context.Context, *s3.PutObjectInput) (s3response.PutObjectOutput, error) {
+				return s3response.PutObjectOutput{}, nil
 			},
 			UploadPartFunc: func(context.Context, *s3.UploadPartInput) (string, error) {
 				return "hello", nil
@@ -929,7 +983,7 @@ func TestS3ApiController_PutActions(t *testing.T) {
 			PutObjectLegalHoldFunc: func(contextMoqParam context.Context, bucket, object, versionId string, status bool) error {
 				return nil
 			},
-			PutObjectRetentionFunc: func(contextMoqParam context.Context, bucket, object, versionId string, retention []byte) error {
+			PutObjectRetentionFunc: func(contextMoqParam context.Context, bucket, object, versionId string, bypass bool, retention []byte) error {
 				return nil
 			},
 			GetObjectLockConfigurationFunc: func(contextMoqParam context.Context, bucket string) ([]byte, error) {
@@ -1163,10 +1217,16 @@ func TestS3ApiController_DeleteBucket(t *testing.T) {
 	app := fiber.New()
 	s3ApiController := S3ApiController{
 		be: &BackendMock{
-			DeleteBucketFunc: func(context.Context, *s3.DeleteBucketInput) error {
+			DeleteBucketFunc: func(_ context.Context, bucket string) error {
 				return nil
 			},
 			DeleteBucketTaggingFunc: func(contextMoqParam context.Context, bucket string) error {
+				return nil
+			},
+			DeleteBucketPolicyFunc: func(contextMoqParam context.Context, bucket string) error {
+				return nil
+			},
+			DeleteBucketOwnershipControlsFunc: func(contextMoqParam context.Context, bucket string) error {
 				return nil
 			},
 		},
@@ -1203,6 +1263,23 @@ func TestS3ApiController_DeleteBucket(t *testing.T) {
 			app:  app,
 			args: args{
 				req: httptest.NewRequest(http.MethodDelete, "/my-bucket?tagging", nil),
+			},
+			wantErr:    false,
+			statusCode: 204,
+		},
+		{
+			name: "Delete-bucket-ownership-controls-success",
+			app:  app,
+			args: args{
+				req: httptest.NewRequest(http.MethodDelete, "/my-bucket?ownershipControls", nil),
+			},
+			wantErr:    false,
+			statusCode: 204,
+		}, {
+			name: "Delete-bucket-policy-success",
+			app:  app,
+			args: args{
+				req: httptest.NewRequest(http.MethodDelete, "/my-bucket?policy", nil),
 			},
 			wantErr:    false,
 			statusCode: 204,
@@ -1306,8 +1383,8 @@ func TestS3ApiController_DeleteActions(t *testing.T) {
 			GetBucketAclFunc: func(context.Context, *s3.GetBucketAclInput) ([]byte, error) {
 				return acldata, nil
 			},
-			DeleteObjectFunc: func(context.Context, *s3.DeleteObjectInput) error {
-				return nil
+			DeleteObjectFunc: func(contextMoqParam context.Context, deleteObjectInput *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
+				return &s3.DeleteObjectOutput{}, nil
 			},
 			AbortMultipartUploadFunc: func(context.Context, *s3.AbortMultipartUploadInput) error {
 				return nil
@@ -1337,8 +1414,8 @@ func TestS3ApiController_DeleteActions(t *testing.T) {
 		GetBucketAclFunc: func(context.Context, *s3.GetBucketAclInput) ([]byte, error) {
 			return acldata, nil
 		},
-		DeleteObjectFunc: func(context.Context, *s3.DeleteObjectInput) error {
-			return s3err.GetAPIError(7)
+		DeleteObjectFunc: func(contextMoqParam context.Context, deleteObjectInput *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 		},
 		GetObjectLockConfigurationFunc: func(contextMoqParam context.Context, bucket string) ([]byte, error) {
 			return nil, s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotFound)
@@ -1551,7 +1628,7 @@ func TestS3ApiController_HeadObject(t *testing.T) {
 				return acldata, nil
 			},
 			HeadObjectFunc: func(context.Context, *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
-				return nil, s3err.GetAPIError(42)
+				return nil, s3err.GetAPIError(s3err.ErrInvalidRequest)
 			},
 		},
 	}
@@ -1620,8 +1697,8 @@ func TestS3ApiController_CreateActions(t *testing.T) {
 			CompleteMultipartUploadFunc: func(context.Context, *s3.CompleteMultipartUploadInput) (*s3.CompleteMultipartUploadOutput, error) {
 				return &s3.CompleteMultipartUploadOutput{}, nil
 			},
-			CreateMultipartUploadFunc: func(context.Context, *s3.CreateMultipartUploadInput) (*s3.CreateMultipartUploadOutput, error) {
-				return &s3.CreateMultipartUploadOutput{}, nil
+			CreateMultipartUploadFunc: func(context.Context, *s3.CreateMultipartUploadInput) (s3response.InitiateMultipartUploadResult, error) {
+				return s3response.InitiateMultipartUploadResult{}, nil
 			},
 			SelectObjectContentFunc: func(context.Context, *s3.SelectObjectContentInput) func(w *bufio.Writer) {
 				return func(w *bufio.Writer) {}
@@ -1656,19 +1733,10 @@ func TestS3ApiController_CreateActions(t *testing.T) {
 			name: "Restore-object-success",
 			app:  app,
 			args: args{
-				req: httptest.NewRequest(http.MethodPost, "/my-bucket/my-key?restore", strings.NewReader(`<root><key>body</key></root>`)),
-			},
-			wantErr:    false,
-			statusCode: 200,
-		},
-		{
-			name: "Restore-object-error",
-			app:  app,
-			args: args{
 				req: httptest.NewRequest(http.MethodPost, "/my-bucket/my-key?restore", nil),
 			},
 			wantErr:    false,
-			statusCode: 500,
+			statusCode: 200,
 		},
 		{
 			name: "Select-object-content-invalid-body",

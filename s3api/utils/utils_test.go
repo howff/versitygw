@@ -1,3 +1,17 @@
+// Copyright 2023 Versity Software
+// This file is licensed under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package utils
 
 import (
@@ -5,9 +19,13 @@ import (
 	"net/http"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/gofiber/fiber/v2"
 	"github.com/valyala/fasthttp"
+	"github.com/versity/versitygw/backend"
+	"github.com/versity/versitygw/s3response"
 )
 
 func TestCreateHttpRequestFromCtx(t *testing.T) {
@@ -260,6 +278,251 @@ func TestParseUint(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("ParseMaxKeys() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFilterObjectAttributes(t *testing.T) {
+	type args struct {
+		attrs  map[s3response.ObjectAttributes]struct{}
+		output s3response.GetObjectAttributesResponse
+	}
+
+	etag, objSize := "etag", int64(3222)
+	delMarker := true
+
+	tests := []struct {
+		name string
+		args args
+		want s3response.GetObjectAttributesResponse
+	}{
+		{
+			name: "keep only ETag",
+			args: args{
+				attrs: map[s3response.ObjectAttributes]struct{}{
+					s3response.ObjectAttributesEtag: {},
+				},
+				output: s3response.GetObjectAttributesResponse{
+					ObjectSize: &objSize,
+					ETag:       &etag,
+				},
+			},
+			want: s3response.GetObjectAttributesResponse{ETag: &etag},
+		},
+		{
+			name: "keep multiple props",
+			args: args{
+				attrs: map[s3response.ObjectAttributes]struct{}{
+					s3response.ObjectAttributesEtag:         {},
+					s3response.ObjectAttributesObjectSize:   {},
+					s3response.ObjectAttributesStorageClass: {},
+				},
+				output: s3response.GetObjectAttributesResponse{
+					ObjectSize:  &objSize,
+					ETag:        &etag,
+					ObjectParts: &s3response.ObjectParts{},
+					VersionId:   &etag,
+				},
+			},
+			want: s3response.GetObjectAttributesResponse{
+				ETag:       &etag,
+				ObjectSize: &objSize,
+			},
+		},
+		{
+			name: "make sure LastModified, DeleteMarker and VersionId are removed",
+			args: args{
+				attrs: map[s3response.ObjectAttributes]struct{}{
+					s3response.ObjectAttributesEtag: {},
+				},
+				output: s3response.GetObjectAttributesResponse{
+					ObjectSize:   &objSize,
+					ETag:         &etag,
+					ObjectParts:  &s3response.ObjectParts{},
+					VersionId:    &etag,
+					LastModified: backend.GetTimePtr(time.Now()),
+					DeleteMarker: &delMarker,
+				},
+			},
+			want: s3response.GetObjectAttributesResponse{
+				ETag: &etag,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := FilterObjectAttributes(tt.args.attrs, tt.args.output); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("FilterObjectAttributes() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsValidOwnership(t *testing.T) {
+	type args struct {
+		val types.ObjectOwnership
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			name: "valid-BucketOwnerEnforced",
+			args: args{
+				val: types.ObjectOwnershipBucketOwnerEnforced,
+			},
+			want: true,
+		},
+		{
+			name: "valid-BucketOwnerPreferred",
+			args: args{
+				val: types.ObjectOwnershipBucketOwnerPreferred,
+			},
+			want: true,
+		},
+		{
+			name: "valid-ObjectWriter",
+			args: args{
+				val: types.ObjectOwnershipObjectWriter,
+			},
+			want: true,
+		},
+		{
+			name: "invalid_value",
+			args: args{
+				val: types.ObjectOwnership("invalid_value"),
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsValidOwnership(tt.args.val); got != tt.want {
+				t.Errorf("IsValidOwnership() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_shouldEscape(t *testing.T) {
+	type args struct {
+		c byte
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			name: "shouldn't-escape-alphanum",
+			args: args{
+				c: 'h',
+			},
+			want: false,
+		},
+		{
+			name: "shouldn't-escape-unreserved-char",
+			args: args{
+				c: '_',
+			},
+			want: false,
+		},
+		{
+			name: "shouldn't-escape-unreserved-number",
+			args: args{
+				c: '0',
+			},
+			want: false,
+		},
+		{
+			name: "shouldn't-escape-path-separator",
+			args: args{
+				c: '/',
+			},
+			want: false,
+		},
+		{
+			name: "should-escape-special-char-1",
+			args: args{
+				c: '&',
+			},
+			want: true,
+		},
+		{
+			name: "should-escape-special-char-2",
+			args: args{
+				c: '*',
+			},
+			want: true,
+		},
+		{
+			name: "should-escape-special-char-3",
+			args: args{
+				c: '(',
+			},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldEscape(tt.args.c); got != tt.want {
+				t.Errorf("shouldEscape() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_escapePath(t *testing.T) {
+	type args struct {
+		s string
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: "empty-string",
+			args: args{
+				s: "",
+			},
+			want: "",
+		},
+		{
+			name: "alphanum-path",
+			args: args{
+				s: "/test-bucket/test-key",
+			},
+			want: "/test-bucket/test-key",
+		},
+		{
+			name: "path-with-unescapable-chars",
+			args: args{
+				s: "/test~bucket/test.key",
+			},
+			want: "/test~bucket/test.key",
+		},
+		{
+			name: "path-with-escapable-chars",
+			args: args{
+				s: "/bucket-*(/test=key&",
+			},
+			want: "/bucket-%2A%28/test%3Dkey%26",
+		},
+		{
+			name: "path-with-space",
+			args: args{
+				s: "/test-bucket/my key",
+			},
+			want: "/test-bucket/my%20key",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := escapePath(tt.args.s); got != tt.want {
+				t.Errorf("escapePath() = %v, want %v", got, tt.want)
 			}
 		})
 	}

@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -41,6 +42,14 @@ import (
 // coming from iAMConfig and iamFile in iam_internal.
 
 type IAMServiceS3 struct {
+	// This mutex will help with racing updates to the IAM data
+	// from multiple requests to this gateway instance, but
+	// will not help with racing updates to multiple load balanced
+	// gateway instances. This is a limitation of the internal
+	// IAM service. All account updates should be sent to a single
+	// gateway instance if possible.
+	sync.RWMutex
+
 	access        string
 	secret        string
 	region        string
@@ -48,12 +57,13 @@ type IAMServiceS3 struct {
 	endpoint      string
 	sslSkipVerify bool
 	debug         bool
+	rootAcc       Account
 	client        *s3.Client
 }
 
 var _ IAMService = &IAMServiceS3{}
 
-func NewS3(access, secret, region, bucket, endpoint string, sslSkipVerify, debug bool) (*IAMServiceS3, error) {
+func NewS3(rootAcc Account, access, secret, region, bucket, endpoint string, sslSkipVerify, debug bool) (*IAMServiceS3, error) {
 	if access == "" {
 		return nil, fmt.Errorf("must provide s3 IAM service access key")
 	}
@@ -78,6 +88,7 @@ func NewS3(access, secret, region, bucket, endpoint string, sslSkipVerify, debug
 		endpoint:      endpoint,
 		sslSkipVerify: sslSkipVerify,
 		debug:         debug,
+		rootAcc:       rootAcc,
 	}
 
 	cfg, err := i.getConfig()
@@ -85,11 +96,25 @@ func NewS3(access, secret, region, bucket, endpoint string, sslSkipVerify, debug
 		return nil, fmt.Errorf("init s3 IAM: %v", err)
 	}
 
+	if endpoint != "" {
+		i.client = s3.NewFromConfig(cfg, func(o *s3.Options) {
+			o.BaseEndpoint = &endpoint
+		})
+		return i, nil
+	}
+
 	i.client = s3.NewFromConfig(cfg)
 	return i, nil
 }
 
 func (s *IAMServiceS3) CreateAccount(account Account) error {
+	if s.rootAcc.Access == account.Access {
+		return ErrUserExists
+	}
+
+	s.Lock()
+	defer s.Unlock()
+
 	conf, err := s.getAccounts()
 	if err != nil {
 		return err
@@ -97,7 +122,7 @@ func (s *IAMServiceS3) CreateAccount(account Account) error {
 
 	_, ok := conf.AccessAccounts[account.Access]
 	if ok {
-		return fmt.Errorf("account already exists")
+		return ErrUserExists
 	}
 	conf.AccessAccounts[account.Access] = account
 
@@ -105,6 +130,13 @@ func (s *IAMServiceS3) CreateAccount(account Account) error {
 }
 
 func (s *IAMServiceS3) GetUserAccount(access string) (Account, error) {
+	if access == s.rootAcc.Access {
+		return s.rootAcc, nil
+	}
+
+	s.RLock()
+	defer s.RUnlock()
+
 	conf, err := s.getAccounts()
 	if err != nil {
 		return Account{}, err
@@ -118,7 +150,30 @@ func (s *IAMServiceS3) GetUserAccount(access string) (Account, error) {
 	return acct, nil
 }
 
+func (s *IAMServiceS3) UpdateUserAccount(access string, props MutableProps) error {
+	s.Lock()
+	defer s.Unlock()
+
+	conf, err := s.getAccounts()
+	if err != nil {
+		return err
+	}
+
+	acc, ok := conf.AccessAccounts[access]
+	if !ok {
+		return ErrNoSuchUser
+	}
+
+	updateAcc(&acc, props)
+	conf.AccessAccounts[access] = acc
+
+	return s.storeAccts(conf)
+}
+
 func (s *IAMServiceS3) DeleteUserAccount(access string) error {
+	s.Lock()
+	defer s.Unlock()
+
 	conf, err := s.getAccounts()
 	if err != nil {
 		return err
@@ -134,6 +189,9 @@ func (s *IAMServiceS3) DeleteUserAccount(access string) error {
 }
 
 func (s *IAMServiceS3) ListUserAccounts() ([]Account, error) {
+	s.RLock()
+	defer s.RUnlock()
+
 	conf, err := s.getAccounts()
 	if err != nil {
 		return nil, err
@@ -148,26 +206,15 @@ func (s *IAMServiceS3) ListUserAccounts() ([]Account, error) {
 	var accs []Account
 	for _, k := range keys {
 		accs = append(accs, Account{
-			Access:    k,
-			Secret:    conf.AccessAccounts[k].Secret,
-			Role:      conf.AccessAccounts[k].Role,
-			UserID:    conf.AccessAccounts[k].UserID,
-			GroupID:   conf.AccessAccounts[k].GroupID,
-			ProjectID: conf.AccessAccounts[k].ProjectID,
+			Access:  k,
+			Secret:  conf.AccessAccounts[k].Secret,
+			Role:    conf.AccessAccounts[k].Role,
+			UserID:  conf.AccessAccounts[k].UserID,
+			GroupID: conf.AccessAccounts[k].GroupID,
 		})
 	}
 
 	return accs, nil
-}
-
-// ResolveEndpoint is used for on prem or non-aws endpoints
-func (s *IAMServiceS3) ResolveEndpoint(service, region string, options ...interface{}) (aws.Endpoint, error) {
-	return aws.Endpoint{
-		PartitionID:       "aws",
-		URL:               s.endpoint,
-		SigningRegion:     s.region,
-		HostnameImmutable: true,
-	}, nil
 }
 
 func (s *IAMServiceS3) Shutdown() error {
@@ -188,11 +235,6 @@ func (s *IAMServiceS3) getConfig() (aws.Config, error) {
 		config.WithHTTPClient(client),
 	}
 
-	if s.endpoint != "" {
-		opts = append(opts,
-			config.WithEndpointResolverWithOptions(s))
-	}
-
 	if s.debug {
 		opts = append(opts,
 			config.WithClientLogMode(aws.LogSigning|aws.LogRetries|aws.LogRequest|aws.LogResponse|aws.LogRequestEventMessage|aws.LogResponseEventMessage))
@@ -210,15 +252,15 @@ func (s *IAMServiceS3) getAccounts() (iAMConfig, error) {
 	})
 	if err != nil {
 		// if the error is object not exists,
-		// init empty accounts stuct and return that
+		// init empty accounts struct and return that
 		var nsk *types.NoSuchKey
 		if errors.As(err, &nsk) {
-			return iAMConfig{}, nil
+			return iAMConfig{AccessAccounts: map[string]Account{}}, nil
 		}
 		var apiErr smithy.APIError
 		if errors.As(err, &apiErr) {
 			if apiErr.ErrorCode() == "NotFound" {
-				return iAMConfig{}, nil
+				return iAMConfig{AccessAccounts: map[string]Account{}}, nil
 			}
 		}
 

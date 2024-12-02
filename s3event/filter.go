@@ -17,6 +17,7 @@ package s3event
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,19 +26,21 @@ import (
 type EventType string
 
 const (
-	EventObjectCreated           EventType = "s3:ObjectCreated:*" // ObjectCreated
-	EventObjectCreatedPut        EventType = "s3:ObjectCreated:Put"
-	EventObjectCreatedPost       EventType = "s3:ObjectCreated:Post"
-	EventObjectCreatedCopy       EventType = "s3:ObjectCreated:Copy"
-	EventCompleteMultipartUpload EventType = "s3:ObjectCreated:CompleteMultipartUpload"
-	EventObjectDeleted           EventType = "s3:ObjectRemoved:Delete" // ObjectRemoved
-	EventObjectTagging           EventType = "s3:ObjectTagging:*"      // ObjectTagging
-	EventObjectTaggingPut        EventType = "s3:ObjectTagging:Put"
-	EventObjectTaggingDelete     EventType = "s3:ObjectTagging:Delete"
-	EventObjectAclPut            EventType = "s3:ObjectAcl:Put"
-	EventObjectRestore           EventType = "s3:ObjectRestore:*" // ObjectRestore
-	EventObjectRestorePost       EventType = "s3:ObjectRestore:Post"
-	EventObjectRestoreCompleted  EventType = "s3:ObjectRestore:Completed"
+	EventObjectCreated              EventType = "s3:ObjectCreated:*" // ObjectCreated
+	EventObjectCreatedPut           EventType = "s3:ObjectCreated:Put"
+	EventObjectCreatedPost          EventType = "s3:ObjectCreated:Post"
+	EventObjectCreatedCopy          EventType = "s3:ObjectCreated:Copy"
+	EventCompleteMultipartUpload    EventType = "s3:ObjectCreated:CompleteMultipartUpload"
+	EventObjectRemoved              EventType = "s3:ObjectRemoved:*"
+	EventObjectRemovedDelete        EventType = "s3:ObjectRemoved:Delete"
+	EventObjectRemovedDeleteObjects EventType = "s3:ObjectRemoved:DeleteObjects" // non AWS custom type for DeleteObjects
+	EventObjectTagging              EventType = "s3:ObjectTagging:*"             // ObjectTagging
+	EventObjectTaggingPut           EventType = "s3:ObjectTagging:Put"
+	EventObjectTaggingDelete        EventType = "s3:ObjectTagging:Delete"
+	EventObjectAclPut               EventType = "s3:ObjectAcl:Put"
+	EventObjectRestore              EventType = "s3:ObjectRestore:*" // ObjectRestore
+	EventObjectRestorePost          EventType = "s3:ObjectRestore:Post"
+	EventObjectRestoreCompleted     EventType = "s3:ObjectRestore:Completed"
 	// EventObjectRestorePost       EventType = "s3:ObjectRestore:Post"
 	// EventObjectRestoreDelete     EventType = "s3:ObjectRestore:Delete"
 )
@@ -48,24 +51,26 @@ func (event EventType) IsValid() bool {
 }
 
 var supportedEventFilters = map[EventType]struct{}{
-	EventObjectCreated:           {},
-	EventObjectCreatedPut:        {},
-	EventObjectCreatedPost:       {},
-	EventObjectCreatedCopy:       {},
-	EventCompleteMultipartUpload: {},
-	EventObjectDeleted:           {},
-	EventObjectTagging:           {},
-	EventObjectTaggingPut:        {},
-	EventObjectTaggingDelete:     {},
-	EventObjectAclPut:            {},
-	EventObjectRestore:           {},
-	EventObjectRestorePost:       {},
-	EventObjectRestoreCompleted:  {},
+	EventObjectCreated:              {},
+	EventObjectCreatedPut:           {},
+	EventObjectCreatedPost:          {},
+	EventObjectCreatedCopy:          {},
+	EventCompleteMultipartUpload:    {},
+	EventObjectRemoved:              {},
+	EventObjectRemovedDelete:        {},
+	EventObjectRemovedDeleteObjects: {},
+	EventObjectTagging:              {},
+	EventObjectTaggingPut:           {},
+	EventObjectTaggingDelete:        {},
+	EventObjectAclPut:               {},
+	EventObjectRestore:              {},
+	EventObjectRestorePost:          {},
+	EventObjectRestoreCompleted:     {},
 }
 
 type EventFilter map[EventType]bool
 
-func parseEventFilters(path string) (EventFilter, error) {
+func parseEventFiltersFile(path string) (EventFilter, error) {
 	// if no filter config file path is specified return nil map
 	if path == "" {
 		return nil, nil
@@ -83,8 +88,12 @@ func parseEventFilters(path string) (EventFilter, error) {
 	}
 	defer file.Close()
 
+	return parseEventFilters(file)
+}
+
+func parseEventFilters(r io.Reader) (EventFilter, error) {
 	var filter EventFilter
-	if err := json.NewDecoder(file).Decode(&filter); err != nil {
+	if err := json.NewDecoder(r).Decode(&filter); err != nil {
 		return nil, err
 	}
 
@@ -112,7 +121,7 @@ func (ef EventFilter) Filter(event EventType) bool {
 	}
 
 	// check wildcard match
-	wildCardEv := EventType(string(event[strings.LastIndex(string(event), ":")+1]) + "*")
+	wildCardEv := EventType(string(event[:strings.LastIndex(string(event), ":")+1]) + "*")
 	wildcard, found := ef[wildCardEv]
 	if found {
 		return wildcard

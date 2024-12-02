@@ -33,6 +33,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -54,6 +55,8 @@ type S3Proxy struct {
 	debug           bool
 }
 
+var _ backend.Backend = &S3Proxy{}
+
 func New(access, secret, endpoint, region string, disableChecksum, sslSkipVerify, debug bool) (*S3Proxy, error) {
 	s := &S3Proxy{
 		access:          access,
@@ -72,8 +75,12 @@ func New(access, secret, endpoint, region string, disableChecksum, sslSkipVerify
 	return s, nil
 }
 
-func (s *S3Proxy) ListBuckets(ctx context.Context, owner string, isAdmin bool) (s3response.ListAllMyBucketsResult, error) {
-	output, err := s.client.ListBuckets(ctx, &s3.ListBucketsInput{})
+func (s *S3Proxy) ListBuckets(ctx context.Context, input s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
+	output, err := s.client.ListBuckets(ctx, &s3.ListBucketsInput{
+		ContinuationToken: &input.ContinuationToken,
+		MaxBuckets:        &input.MaxBuckets,
+		Prefix:            &input.Prefix,
+	})
 	if err != nil {
 		return s3response.ListAllMyBucketsResult{}, handleError(err)
 	}
@@ -93,6 +100,8 @@ func (s *S3Proxy) ListBuckets(ctx context.Context, owner string, isAdmin bool) (
 		Buckets: s3response.ListAllMyBucketsList{
 			Bucket: buckets,
 		},
+		ContinuationToken: backend.GetStringFromPtr(output.ContinuationToken),
+		Prefix:            backend.GetStringFromPtr(output.Prefix),
 	}, nil
 }
 
@@ -109,8 +118,8 @@ func (s *S3Proxy) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 
 	var tagSet []types.Tag
 	tagSet = append(tagSet, types.Tag{
-		Key:   backend.GetStringPtr(aclKey),
-		Value: backend.GetStringPtr(base64Encode(acl)),
+		Key:   backend.GetPtrFromString(aclKey),
+		Value: backend.GetPtrFromString(base64Encode(acl)),
 	})
 
 	_, err = s.client.PutBucketTagging(ctx, &s3.PutBucketTaggingInput{
@@ -122,14 +131,100 @@ func (s *S3Proxy) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 	return handleError(err)
 }
 
-func (s *S3Proxy) DeleteBucket(ctx context.Context, input *s3.DeleteBucketInput) error {
-	_, err := s.client.DeleteBucket(ctx, input)
+func (s *S3Proxy) DeleteBucket(ctx context.Context, bucket string) error {
+	_, err := s.client.DeleteBucket(ctx, &s3.DeleteBucketInput{
+		Bucket: &bucket,
+	})
 	return handleError(err)
 }
 
-func (s *S3Proxy) CreateMultipartUpload(ctx context.Context, input *s3.CreateMultipartUploadInput) (*s3.CreateMultipartUploadOutput, error) {
+func (s *S3Proxy) PutBucketOwnershipControls(ctx context.Context, bucket string, ownership types.ObjectOwnership) error {
+	_, err := s.client.PutBucketOwnershipControls(ctx, &s3.PutBucketOwnershipControlsInput{
+		Bucket: &bucket,
+		OwnershipControls: &types.OwnershipControls{
+			Rules: []types.OwnershipControlsRule{
+				{
+					ObjectOwnership: ownership,
+				},
+			},
+		},
+	})
+	return handleError(err)
+}
+
+func (s *S3Proxy) GetBucketOwnershipControls(ctx context.Context, bucket string) (types.ObjectOwnership, error) {
+	var ownship types.ObjectOwnership
+	resp, err := s.client.GetBucketOwnershipControls(ctx, &s3.GetBucketOwnershipControlsInput{
+		Bucket: &bucket,
+	})
+	if err != nil {
+		return ownship, handleError(err)
+	}
+	return resp.OwnershipControls.Rules[0].ObjectOwnership, nil
+}
+func (s *S3Proxy) DeleteBucketOwnershipControls(ctx context.Context, bucket string) error {
+	_, err := s.client.DeleteBucketOwnershipControls(ctx, &s3.DeleteBucketOwnershipControlsInput{
+		Bucket: &bucket,
+	})
+	return handleError(err)
+}
+
+func (s *S3Proxy) PutBucketVersioning(ctx context.Context, bucket string, status types.BucketVersioningStatus) error {
+	_, err := s.client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+		Bucket: &bucket,
+		VersioningConfiguration: &types.VersioningConfiguration{
+			Status: status,
+		},
+	})
+
+	return handleError(err)
+}
+
+func (s *S3Proxy) GetBucketVersioning(ctx context.Context, bucket string) (s3response.GetBucketVersioningOutput, error) {
+	out, err := s.client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
+		Bucket: &bucket,
+	})
+
+	return s3response.GetBucketVersioningOutput{
+		Status:    &out.Status,
+		MFADelete: &out.MFADelete,
+	}, handleError(err)
+}
+
+func (s *S3Proxy) ListObjectVersions(ctx context.Context, input *s3.ListObjectVersionsInput) (s3response.ListVersionsResult, error) {
+	out, err := s.client.ListObjectVersions(ctx, input)
+	if err != nil {
+		return s3response.ListVersionsResult{}, handleError(err)
+	}
+
+	return s3response.ListVersionsResult{
+		CommonPrefixes:      out.CommonPrefixes,
+		DeleteMarkers:       out.DeleteMarkers,
+		Delimiter:           out.Delimiter,
+		EncodingType:        out.EncodingType,
+		IsTruncated:         out.IsTruncated,
+		KeyMarker:           out.KeyMarker,
+		MaxKeys:             out.MaxKeys,
+		Name:                out.Name,
+		NextKeyMarker:       out.NextKeyMarker,
+		NextVersionIdMarker: out.NextVersionIdMarker,
+		Prefix:              out.Prefix,
+		VersionIdMarker:     input.VersionIdMarker,
+		Versions:            out.Versions,
+	}, nil
+}
+
+func (s *S3Proxy) CreateMultipartUpload(ctx context.Context, input *s3.CreateMultipartUploadInput) (s3response.InitiateMultipartUploadResult, error) {
 	out, err := s.client.CreateMultipartUpload(ctx, input)
-	return out, handleError(err)
+	if err != nil {
+		return s3response.InitiateMultipartUploadResult{}, handleError(err)
+	}
+
+	return s3response.InitiateMultipartUploadResult{
+		Bucket:   *out.Bucket,
+		Key:      *out.Key,
+		UploadId: *out.UploadId,
+	}, nil
 }
 
 func (s *S3Proxy) CompleteMultipartUpload(ctx context.Context, input *s3.CompleteMultipartUploadInput) (*s3.CompleteMultipartUploadOutput, error) {
@@ -161,8 +256,8 @@ func (s *S3Proxy) ListMultipartUploads(ctx context.Context, input *s3.ListMultip
 				ID:          *u.Owner.ID,
 				DisplayName: *u.Owner.DisplayName,
 			},
-			StorageClass: string(u.StorageClass),
-			Initiated:    u.Initiated.Format(backend.RFC3339TimeFormat),
+			StorageClass: u.StorageClass,
+			Initiated:    *u.Initiated,
 		})
 	}
 
@@ -199,7 +294,7 @@ func (s *S3Proxy) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3re
 	for _, p := range output.Parts {
 		parts = append(parts, s3response.Part{
 			PartNumber:   int(*p.PartNumber),
-			LastModified: p.LastModified.Format(backend.RFC3339TimeFormat),
+			LastModified: *p.LastModified,
 			ETag:         *p.ETag,
 			Size:         *p.Size,
 		})
@@ -228,7 +323,7 @@ func (s *S3Proxy) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3re
 			ID:          *output.Owner.ID,
 			DisplayName: *output.Owner.DisplayName,
 		},
-		StorageClass:         string(output.StorageClass),
+		StorageClass:         output.StorageClass,
 		PartNumberMarker:     pnm,
 		NextPartNumberMarker: npmn,
 		MaxParts:             int(*output.MaxParts),
@@ -262,17 +357,25 @@ func (s *S3Proxy) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyIn
 	}, nil
 }
 
-func (s *S3Proxy) PutObject(ctx context.Context, input *s3.PutObjectInput) (string, error) {
+func (s *S3Proxy) PutObject(ctx context.Context, input *s3.PutObjectInput) (s3response.PutObjectOutput, error) {
 	// streaming backend is not seekable,
 	// use unsigned payload for streaming ops
 	output, err := s.client.PutObject(ctx, input, s3.WithAPIOptions(
 		v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware,
 	))
 	if err != nil {
-		return "", handleError(err)
+		return s3response.PutObjectOutput{}, handleError(err)
 	}
 
-	return *output.ETag, nil
+	var versionID string
+	if output.VersionId != nil {
+		versionID = *output.VersionId
+	}
+
+	return s3response.PutObjectOutput{
+		ETag:      *output.ETag,
+		VersionID: versionID,
+	}, nil
 }
 
 func (s *S3Proxy) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
@@ -280,24 +383,49 @@ func (s *S3Proxy) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 	return out, handleError(err)
 }
 
-func (s *S3Proxy) GetObject(ctx context.Context, input *s3.GetObjectInput, w io.Writer) (*s3.GetObjectOutput, error) {
+func (s *S3Proxy) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
 	output, err := s.client.GetObject(ctx, input)
 	if err != nil {
 		return nil, handleError(err)
-	}
-	defer output.Body.Close()
-
-	_, err = io.Copy(w, output.Body)
-	if err != nil {
-		return nil, err
 	}
 
 	return output, nil
 }
 
-func (s *S3Proxy) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAttributesInput) (*s3.GetObjectAttributesOutput, error) {
+func (s *S3Proxy) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAttributesInput) (s3response.GetObjectAttributesResponse, error) {
 	out, err := s.client.GetObjectAttributes(ctx, input)
-	return out, handleError(err)
+
+	parts := s3response.ObjectParts{}
+	objParts := out.ObjectParts
+	if objParts != nil {
+		if objParts.PartNumberMarker != nil {
+			partNumberMarker, err := strconv.Atoi(*objParts.PartNumberMarker)
+			if err != nil {
+				parts.PartNumberMarker = partNumberMarker
+			}
+			if objParts.NextPartNumberMarker != nil {
+				nextPartNumberMarker, err := strconv.Atoi(*objParts.NextPartNumberMarker)
+				if err != nil {
+					parts.NextPartNumberMarker = nextPartNumberMarker
+				}
+			}
+			if objParts.IsTruncated != nil {
+				parts.IsTruncated = *objParts.IsTruncated
+			}
+			if objParts.MaxParts != nil {
+				parts.MaxParts = int(*objParts.MaxParts)
+			}
+			parts.Parts = objParts.Parts
+		}
+	}
+
+	return s3response.GetObjectAttributesResponse{
+		ETag:         out.ETag,
+		LastModified: out.LastModified,
+		ObjectSize:   out.ObjectSize,
+		StorageClass: out.StorageClass,
+		ObjectParts:  &parts,
+	}, handleError(err)
 }
 
 func (s *S3Proxy) CopyObject(ctx context.Context, input *s3.CopyObjectInput) (*s3.CopyObjectOutput, error) {
@@ -305,19 +433,52 @@ func (s *S3Proxy) CopyObject(ctx context.Context, input *s3.CopyObjectInput) (*s
 	return out, handleError(err)
 }
 
-func (s *S3Proxy) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (*s3.ListObjectsOutput, error) {
+func (s *S3Proxy) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
 	out, err := s.client.ListObjects(ctx, input)
-	return out, handleError(err)
+	if err != nil {
+		return s3response.ListObjectsResult{}, handleError(err)
+	}
+
+	contents := convertObjects(out.Contents)
+
+	return s3response.ListObjectsResult{
+		CommonPrefixes: out.CommonPrefixes,
+		Contents:       contents,
+		Delimiter:      out.Delimiter,
+		IsTruncated:    out.IsTruncated,
+		Marker:         out.Marker,
+		MaxKeys:        out.MaxKeys,
+		Name:           out.Name,
+		NextMarker:     out.NextMarker,
+		Prefix:         out.Prefix,
+	}, nil
 }
 
-func (s *S3Proxy) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
+func (s *S3Proxy) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Input) (s3response.ListObjectsV2Result, error) {
 	out, err := s.client.ListObjectsV2(ctx, input)
-	return out, handleError(err)
+	if err != nil {
+		return s3response.ListObjectsV2Result{}, handleError(err)
+	}
+
+	contents := convertObjects(out.Contents)
+
+	return s3response.ListObjectsV2Result{
+		CommonPrefixes:        out.CommonPrefixes,
+		Contents:              contents,
+		Delimiter:             out.Delimiter,
+		IsTruncated:           out.IsTruncated,
+		ContinuationToken:     out.ContinuationToken,
+		MaxKeys:               out.MaxKeys,
+		Name:                  out.Name,
+		NextContinuationToken: out.NextContinuationToken,
+		Prefix:                out.Prefix,
+		KeyCount:              out.KeyCount,
+	}, nil
 }
 
-func (s *S3Proxy) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) error {
-	_, err := s.client.DeleteObject(ctx, input)
-	return handleError(err)
+func (s *S3Proxy) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
+	res, err := s.client.DeleteObject(ctx, input)
+	return res, handleError(err)
 }
 
 func (s *S3Proxy) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
@@ -369,8 +530,8 @@ func (s *S3Proxy) PutBucketAcl(ctx context.Context, bucket string, data []byte) 
 	for i, tag := range tagout.TagSet {
 		if *tag.Key == aclKey {
 			tagout.TagSet[i] = types.Tag{
-				Key:   backend.GetStringPtr(aclKey),
-				Value: backend.GetStringPtr(base64Encode(data)),
+				Key:   backend.GetPtrFromString(aclKey),
+				Value: backend.GetPtrFromString(base64Encode(data)),
 			}
 			found = true
 			break
@@ -378,8 +539,8 @@ func (s *S3Proxy) PutBucketAcl(ctx context.Context, bucket string, data []byte) 
 	}
 	if !found {
 		tagout.TagSet = append(tagout.TagSet, types.Tag{
-			Key:   backend.GetStringPtr(aclKey),
-			Value: backend.GetStringPtr(base64Encode(data)),
+			Key:   backend.GetPtrFromString(aclKey),
+			Value: backend.GetPtrFromString(base64Encode(data)),
 		})
 	}
 
@@ -436,8 +597,135 @@ func (s *S3Proxy) DeleteObjectTagging(ctx context.Context, bucket, object string
 	return handleError(err)
 }
 
-func (s *S3Proxy) ChangeBucketOwner(ctx context.Context, bucket, newOwner string) error {
-	req, err := http.NewRequest(http.MethodPatch, fmt.Sprintf("%v/change-bucket-owner/?bucket=%v&owner=%v", s.endpoint, bucket, newOwner), nil)
+func (s *S3Proxy) PutBucketPolicy(ctx context.Context, bucket string, policy []byte) error {
+	_, err := s.client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+		Bucket: &bucket,
+		Policy: backend.GetPtrFromString(string(policy)),
+	})
+	return handleError(err)
+}
+
+func (s *S3Proxy) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, error) {
+	policy, err := s.client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{
+		Bucket: &bucket,
+	})
+	if err != nil {
+		return nil, handleError(err)
+	}
+
+	result := []byte{}
+	if policy.Policy != nil {
+		result = []byte(*policy.Policy)
+	}
+
+	return result, nil
+}
+
+func (s *S3Proxy) DeleteBucketPolicy(ctx context.Context, bucket string) error {
+	_, err := s.client.DeleteBucketPolicy(ctx, &s3.DeleteBucketPolicyInput{
+		Bucket: &bucket,
+	})
+	return handleError(err)
+}
+
+func (s *S3Proxy) PutObjectLockConfiguration(ctx context.Context, bucket string, config []byte) error {
+	cfg, err := auth.ParseBucketLockConfigurationOutput(config)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.client.PutObjectLockConfiguration(ctx, &s3.PutObjectLockConfigurationInput{
+		Bucket:                  &bucket,
+		ObjectLockConfiguration: cfg,
+	})
+
+	return handleError(err)
+}
+
+func (s *S3Proxy) GetObjectLockConfiguration(ctx context.Context, bucket string) ([]byte, error) {
+	resp, err := s.client.GetObjectLockConfiguration(ctx, &s3.GetObjectLockConfigurationInput{
+		Bucket: &bucket,
+	})
+	if err != nil {
+		return nil, handleError(err)
+	}
+
+	config := auth.BucketLockConfig{
+		Enabled:          resp.ObjectLockConfiguration.ObjectLockEnabled == types.ObjectLockEnabledEnabled,
+		DefaultRetention: resp.ObjectLockConfiguration.Rule.DefaultRetention,
+	}
+
+	return json.Marshal(config)
+}
+
+func (s *S3Proxy) PutObjectRetention(ctx context.Context, bucket, object, versionId string, bypass bool, retention []byte) error {
+	ret, err := auth.ParseObjectLockRetentionOutput(retention)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+		Bucket:                    &bucket,
+		Key:                       &object,
+		VersionId:                 &versionId,
+		Retention:                 ret,
+		BypassGovernanceRetention: &bypass,
+	})
+	return handleError(err)
+}
+
+func (s *S3Proxy) GetObjectRetention(ctx context.Context, bucket, object, versionId string) ([]byte, error) {
+	resp, err := s.client.GetObjectRetention(ctx, &s3.GetObjectRetentionInput{
+		Bucket:    &bucket,
+		Key:       &object,
+		VersionId: &versionId,
+	})
+	if err != nil {
+		return nil, handleError(err)
+	}
+
+	return json.Marshal(resp.Retention)
+}
+
+func (s *S3Proxy) PutObjectLegalHold(ctx context.Context, bucket, object, versionId string, status bool) error {
+	var st types.ObjectLockLegalHoldStatus
+	if status {
+		st = types.ObjectLockLegalHoldStatusOn
+	} else {
+		st = types.ObjectLockLegalHoldStatusOff
+	}
+
+	_, err := s.client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
+		Bucket:    &bucket,
+		Key:       &object,
+		VersionId: &versionId,
+		LegalHold: &types.ObjectLockLegalHold{
+			Status: st,
+		},
+	})
+	return handleError(err)
+}
+
+func (s *S3Proxy) GetObjectLegalHold(ctx context.Context, bucket, object, versionId string) (*bool, error) {
+	resp, err := s.client.GetObjectLegalHold(ctx, &s3.GetObjectLegalHoldInput{
+		Bucket:    &bucket,
+		Key:       &object,
+		VersionId: &versionId,
+	})
+	if err != nil {
+		return nil, handleError(err)
+	}
+
+	status := resp.LegalHold.Status == types.ObjectLockLegalHoldStatusOn
+	return &status, nil
+}
+
+func (s *S3Proxy) ChangeBucketOwner(ctx context.Context, bucket string, acl []byte) error {
+	var acll auth.ACL
+	if err := json.Unmarshal(acl, &acll); err != nil {
+		return fmt.Errorf("unmarshal acl: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPatch, fmt.Sprintf("%v/change-bucket-owner/?bucket=%v&owner=%v", s.endpoint, bucket, acll.Owner), nil)
 	if err != nil {
 		return fmt.Errorf("failed to send the request: %w", err)
 	}
@@ -467,7 +755,7 @@ func (s *S3Proxy) ChangeBucketOwner(ctx context.Context, bucket, newOwner string
 			return err
 		}
 		defer resp.Body.Close()
-		return fmt.Errorf(string(body))
+		return fmt.Errorf("%v", string(body))
 	}
 
 	return nil
@@ -542,4 +830,22 @@ func base64Decode(encoded string) ([]byte, error) {
 		return nil, err
 	}
 	return decoded, nil
+}
+
+func convertObjects(objs []types.Object) []s3response.Object {
+	result := make([]s3response.Object, len(objs))
+
+	for _, obj := range objs {
+		result = append(result, s3response.Object{
+			ETag:          obj.ETag,
+			Key:           obj.Key,
+			LastModified:  obj.LastModified,
+			Owner:         obj.Owner,
+			Size:          obj.Size,
+			RestoreStatus: obj.RestoreStatus,
+			StorageClass:  obj.StorageClass,
+		})
+	}
+
+	return result
 }

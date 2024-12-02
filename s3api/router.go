@@ -18,7 +18,9 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/backend"
+	"github.com/versity/versitygw/metrics"
 	"github.com/versity/versitygw/s3api/controllers"
+	"github.com/versity/versitygw/s3api/middlewares"
 	"github.com/versity/versitygw/s3event"
 	"github.com/versity/versitygw/s3log"
 )
@@ -27,26 +29,29 @@ type S3ApiRouter struct {
 	WithAdmSrv bool
 }
 
-func (sa *S3ApiRouter) Init(app *fiber.App, be backend.Backend, iam auth.IAMService, logger s3log.AuditLogger, evs s3event.S3EventSender, debug bool) {
-	s3ApiController := controllers.New(be, iam, logger, evs, debug)
+func (sa *S3ApiRouter) Init(app *fiber.App, be backend.Backend, iam auth.IAMService, logger s3log.AuditLogger, aLogger s3log.AuditLogger, evs s3event.S3EventSender, mm *metrics.Manager, debug bool, readonly bool) {
+	s3ApiController := controllers.New(be, iam, logger, evs, mm, debug, readonly)
 
 	if sa.WithAdmSrv {
-		adminController := controllers.NewAdminController(iam, be)
+		adminController := controllers.NewAdminController(iam, be, aLogger)
 
 		// CreateUser admin api
-		app.Patch("/create-user", adminController.CreateUser)
+		app.Patch("/create-user", middlewares.IsAdmin(logger), adminController.CreateUser)
 
 		// DeleteUsers admin api
-		app.Patch("/delete-user", adminController.DeleteUser)
+		app.Patch("/delete-user", middlewares.IsAdmin(logger), adminController.DeleteUser)
+
+		// UpdateUser admin api
+		app.Patch("update-user", middlewares.IsAdmin(logger), adminController.UpdateUser)
 
 		// ListUsers admin api
-		app.Patch("/list-users", adminController.ListUsers)
+		app.Patch("/list-users", middlewares.IsAdmin(logger), adminController.ListUsers)
 
 		// ChangeBucketOwner admin api
-		app.Patch("/change-bucket-owner", adminController.ChangeBucketOwner)
+		app.Patch("/change-bucket-owner", middlewares.IsAdmin(logger), adminController.ChangeBucketOwner)
 
 		// ListBucketsAndOwners admin api
-		app.Patch("/list-buckets", adminController.ListBuckets)
+		app.Patch("/list-buckets", middlewares.IsAdmin(logger), adminController.ListBuckets)
 	}
 
 	// ListBuckets action
